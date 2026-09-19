@@ -2198,6 +2198,15 @@ void rr_video_sync() {
     // shared frontend code.
 }
 bool rr_video_vsync_set(bool enabled) {
+    // RETRORUN_VSYNC=0/1 overrides the config for this launch only, so a
+    // launcher script can turn vsync on for one system (e.g. with threaded
+    // presentation) without changing the retrorun.cfg other systems share.
+    static int forced = -2;
+    if (forced == -2) {
+        const char* env = std::getenv("RETRORUN_VSYNC");
+        forced = env ? (std::atoi(env) != 0 ? 1 : 0) : -1;
+    }
+    if (forced >= 0) enabled = forced == 1;
     vsync_enabled = enabled;
     bool applied = false;
     bool attempted = false;
