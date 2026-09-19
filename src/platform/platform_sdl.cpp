@@ -17,14 +17,20 @@
 #include <SDL_opengl.h>
 #endif
 #include <png.h>
+#ifdef RR_SDL_GLES
+#include <EGL/egl.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -112,6 +118,12 @@ static rr_presenter_t* active_presenter = NULL;
 static rr_context_t* active_context = NULL;
 static bool controller_mappings_loaded = false;
 static uint64_t next_surface_generation = 1;
+// Framebuffer the frontend composes the visible frame into. 0 (the window)
+// on the synchronous path; an offscreen texture while threaded presentation
+// is active -- see present_worker below.
+static GLuint present_target_fbo = 0;
+static void present_worker_release();
+static void present_worker_shutdown();
 
 static void refresh_display_size(rr_display_t* display) {
     if (!display || !display->window) return;
@@ -826,6 +838,7 @@ void rr_presenter_drain(rr_presenter_t*) {}
 static void clear_presenter(rr_presenter_t* p) { SDL_SetRenderDrawColor(p->renderer, 8, 8, 8, 255); SDL_RenderClear(p->renderer); }
 void rr_presenter_post(rr_presenter_t* p, rr_surface_t* s, int sx, int sy, int sw, int sh,
                        int dx, int dy, int dw, int dh, rr_rotation_t r) {
+    present_worker_release();
     const uint64_t generation = benchmark_capture_generation();
     const auto started = generation ? std::chrono::steady_clock::now()
                                     : std::chrono::steady_clock::time_point{};
@@ -838,8 +851,9 @@ void rr_presenter_post(rr_presenter_t* p, rr_surface_t* s, int sx, int sy, int s
 bool rr_presenter_post_direct(rr_presenter_t*, rr_surface_t*, int, int, int, int,
                               int, int, int, int, rr_rotation_t) { return false; }
 void rr_presenter_direct_disable(rr_presenter_t*) {}
-void rr_presenter_black(rr_presenter_t* p, int, int, int, int, rr_rotation_t) { clear_presenter(p); SDL_RenderPresent(p->renderer); }
+void rr_presenter_black(rr_presenter_t* p, int, int, int, int, rr_rotation_t) { present_worker_release(); clear_presenter(p); SDL_RenderPresent(p->renderer); }
 void rr_presenter_wait_for_loading_screen(rr_presenter_t* presenter, unsigned milliseconds) {
+    present_worker_release();
     if (!presenter || !presenter->display || !presenter->display->window ||
         presenter->loading_wait_completed)
         return;
@@ -861,6 +875,7 @@ void rr_presenter_wait_for_loading_screen(rr_presenter_t* presenter, unsigned mi
 void rr_presenter_post_multiple(rr_presenter_t* p, rr_surface_t* base, status* o,
                                 int sx, int sy, int sw, int sh, int dx, int dy, int dw, int dh,
                                 rr_rotation_t r, rr_rotation_t overlay_rotation, bool) {
+    present_worker_release();
     const uint64_t generation = benchmark_capture_generation();
     const auto started = generation ? std::chrono::steady_clock::now()
                                     : std::chrono::steady_clock::time_point{};
@@ -1090,7 +1105,7 @@ static bool draw_post_processed_frame(rr_context_t* context, int source_width, i
     if ((video_shader == RR_VIDEO_SHADER_OFF && rotation == RR_ROTATION_DEGREES_0) ||
         !ensure_post_pipeline(context)) return false;
 
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, present_target_fbo);
     glViewport(left, bottom, right - left, top - bottom);
     glUseProgram(context->post_program);
     glActiveTexture(GL_TEXTURE0);
@@ -1248,6 +1263,7 @@ rr_context_t* rr_context_create(rr_display_t* display, int width, int height,
 }
 void rr_context_destroy(rr_context_t* context) {
     if (!context) return;
+    present_worker_shutdown();
     if (active_context == context) active_context = NULL;
     if (context->gl) SDL_GL_MakeCurrent(context->window, context->gl);
     if (context->post_vbo) glDeleteBuffers(1, &context->post_vbo);
@@ -1360,7 +1376,7 @@ static void blit_overlay(rr_context_t* context, rr_surface_t* surface,
     const int bottom = drawable_height - static_cast<int>((y + height) * scale_y);
     const int top = drawable_height - static_cast<int>(y * scale_y);
 
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, present_target_fbo);
     glViewport(left, bottom, right - left, top - bottom);
     glUseProgram(context->post_program);
     glUniform1i(context->uniform_frame_texture, 0);
@@ -1447,6 +1463,355 @@ static void blit_decoration_damage(rr_context_t* context, rr_surface_t* surface,
     if (!scissor_was_enabled) glDisable(GL_SCISSOR_TEST);
 }
 
+// ---------------------------------------------------------------------------
+// Threaded presentation (SDL2 + OpenGL ES, frontend-FBO mode).
+//
+// Why: on the Mali-G31 blob (libmali r13p0, GBM) SDL_GL_SwapWindow() does not
+// return until the GPU has finished the frame being presented. On the thread
+// that also runs retro_run() that serializes the whole pipeline: the core
+// can't start frame N+1 on the CPU while the GPU draws frame N. Measured with
+// Flycast/Shenmue on an RG351MP-class device: 33.3ms of every 58ms frame spent
+// inside the swap, with the core-side CPU work (~24ms) and the GPU work
+// (~35ms) running back to back instead of overlapped.
+//
+// How: the main thread keeps doing exactly the composition it always did
+// (core frame, shader, rotation, decoration, overlays, menus), but into an
+// offscreen texture instead of the window. It then fences that work and hands
+// the texture to a presenter thread, which owns the window surface through a
+// context shared with the core's: it waits for the fence on the GPU, copies
+// the texture 1:1 to the window and calls SDL_GL_SwapWindow -- and is the one
+// that blocks there. The core context stays current on the main thread with
+// no surface (EGL_KHR_surfaceless_context), which is all a core rendering into
+// the frontend FBO needs. No overlay/menu state crosses threads: only a
+// texture, a fence and a generation number do.
+//
+// Two textures ping-pong, and the main thread never gets more than one frame
+// ahead of the one being presented (backpressure on the job slot).
+//
+// Opt-in: RETRORUN_SDL_THREADED_PRESENT=1. The default-framebuffer
+// compatibility mode is never threaded (its cores draw to the window itself).
+// Anything else that needs the window on the main thread (the SDL_Renderer
+// presenter used for loading screens and software cores, context teardown)
+// hands it back first via present_worker_release().
+// ---------------------------------------------------------------------------
+#ifdef RR_SDL_GLES
+namespace {
+struct present_job {
+    int slot = 0;
+    GLsync fence = 0;
+    int width = 0;
+    int height = 0;
+    uint64_t generation = 0;
+};
+struct present_worker_state {
+    bool checked = false;
+    bool enabled = false;
+    bool failed = false;
+    bool started = false;
+    bool owns_surface = false;      // the presenter thread holds the window
+    SDL_Window* window = NULL;
+    SDL_GLContext gl2 = NULL;       // presenter context, shared with the core's
+    EGLDisplay dpy = EGL_NO_DISPLAY;
+    EGLSurface surface = EGL_NO_SURFACE;
+    EGLContext core_ctx = EGL_NO_CONTEXT;
+    std::thread thread;
+    std::mutex mutex;
+    std::condition_variable cv;
+    enum Command { None, Acquire, Release, Quit } command = None;
+    bool command_done = false;
+    int swap_interval = 0;
+    bool swap_interval_dirty = false;
+    bool job_pending = false;
+    bool busy = false;              // presenter is working on a job
+    present_job job;
+    bool slot_busy[2] = {false, false};
+    GLsync slot_release[2] = {0, 0};
+    int next_slot = 0;
+    // main-thread (core context) side
+    GLuint target_texture[2] = {0, 0};
+    GLuint target_fbo[2] = {0, 0};
+    int target_width = 0;
+    int target_height = 0;
+    int current_slot = -1;
+    // presenter-thread side (FBOs are not shared between contexts)
+    GLuint read_fbo[2] = {0, 0};
+    GLuint read_fbo_texture[2] = {0, 0};
+};
+present_worker_state pw;
+}
+
+static void present_worker_thread() {
+    std::unique_lock<std::mutex> lock(pw.mutex);
+    for (;;) {
+        pw.cv.wait(lock, [] { return pw.command != present_worker_state::None || pw.job_pending; });
+        if (pw.command == present_worker_state::Quit) {
+            pw.command = present_worker_state::None;
+            pw.command_done = true;
+            pw.cv.notify_all();
+            break;
+        }
+        if (pw.command == present_worker_state::Acquire) {
+            lock.unlock();
+            SDL_GL_MakeCurrent(pw.window, pw.gl2);
+            SDL_GL_SetSwapInterval(pw.swap_interval);
+            lock.lock();
+            pw.command = present_worker_state::None;
+            pw.command_done = true;
+            pw.cv.notify_all();
+            continue;
+        }
+        if (pw.command == present_worker_state::Release) {
+            lock.unlock();
+            for (int i = 0; i < 2; ++i) {
+                if (pw.read_fbo[i]) glDeleteFramebuffers(1, &pw.read_fbo[i]);
+                pw.read_fbo[i] = 0;
+                pw.read_fbo_texture[i] = 0;
+            }
+            glFinish();
+            SDL_GL_MakeCurrent(pw.window, NULL);
+            lock.lock();
+            pw.command = present_worker_state::None;
+            pw.command_done = true;
+            pw.cv.notify_all();
+            continue;
+        }
+        // A job: present one composed frame.
+        present_job job = pw.job;
+        pw.job_pending = false;
+        pw.busy = true;
+        const bool interval_dirty = pw.swap_interval_dirty;
+        const int interval = pw.swap_interval;
+        pw.swap_interval_dirty = false;
+        const GLuint texture = pw.target_texture[job.slot];
+        pw.cv.notify_all();
+        lock.unlock();
+
+        if (interval_dirty) SDL_GL_SetSwapInterval(interval);
+        glWaitSync(job.fence, 0, GL_TIMEOUT_IGNORED);
+        glDeleteSync(job.fence);
+        if (pw.read_fbo_texture[job.slot] != texture) {
+            if (!pw.read_fbo[job.slot]) glGenFramebuffers(1, &pw.read_fbo[job.slot]);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, pw.read_fbo[job.slot]);
+            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                                   texture, 0);
+            pw.read_fbo_texture[job.slot] = texture;
+        }
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, pw.read_fbo[job.slot]);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        glBlitFramebuffer(0, 0, job.width, job.height, 0, 0, job.width, job.height,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        GLsync released = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        glFlush();
+
+        lock.lock();
+        pw.slot_release[job.slot] = released;
+        pw.slot_busy[job.slot] = false;
+        pw.cv.notify_all();
+        lock.unlock();
+
+        const auto started = std::chrono::steady_clock::now();
+        SDL_GL_SwapWindow(pw.window);
+        if (job.generation)
+            benchmark_presentation_completed(BenchmarkPresentation::Fallback,
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - started).count(), job.generation);
+
+        lock.lock();
+        pw.busy = false;
+        pw.cv.notify_all();
+    }
+}
+
+static bool present_worker_wanted(rr_context_t* context) {
+    if (!pw.checked) {
+        pw.checked = true;
+        const char* env = std::getenv("RETRORUN_SDL_THREADED_PRESENT");
+        pw.enabled = env && std::atoi(env) != 0;
+        if (pw.enabled)
+            std::fprintf(stderr, "RetroRun SDL threaded presentation requested\n");
+    }
+    return pw.enabled && !pw.failed && context && !context->default_framebuffer;
+}
+
+// Main thread: give the window to the presenter thread.
+static bool present_worker_acquire(rr_context_t* context) {
+    if (pw.owns_surface) return true;
+    if (!pw.started) {
+        pw.window = context->window;
+        pw.dpy = eglGetCurrentDisplay();
+        pw.surface = eglGetCurrentSurface(EGL_DRAW);
+        pw.core_ctx = eglGetCurrentContext();
+        if (pw.dpy == EGL_NO_DISPLAY || pw.surface == EGL_NO_SURFACE ||
+            pw.core_ctx == EGL_NO_CONTEXT) {
+            std::fprintf(stderr, "RetroRun SDL threaded presentation: no current EGL state\n");
+            pw.failed = true;
+            return false;
+        }
+        SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+        pw.gl2 = SDL_GL_CreateContext(pw.window);
+        SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+        // SDL_GL_CreateContext made the new context current here; restore the
+        // core's, including SDL's own record of what is current.
+        SDL_GL_MakeCurrent(context->window, context->gl);
+        if (!pw.gl2) {
+            std::fprintf(stderr, "RetroRun SDL threaded presentation: shared context failed: %s\n",
+                         SDL_GetError());
+            pw.failed = true;
+            return false;
+        }
+        pw.swap_interval = vsync_enabled ? 1 : 0;
+        pw.thread = std::thread(present_worker_thread);
+        pw.started = true;
+        std::fprintf(stderr, "RetroRun SDL threaded presentation active\n");
+    }
+    glFlush();
+    // Keep the core context current on this thread, without the window.
+    // SDL still records (window, core context) as current here, so
+    // rr_context_make_current() stays a no-op and never re-grabs the window.
+    if (!eglMakeCurrent(pw.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, pw.core_ctx)) {
+        std::fprintf(stderr, "RetroRun SDL threaded presentation: surfaceless context failed (0x%x)\n",
+                     eglGetError());
+        pw.failed = true;
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(pw.mutex);
+    pw.command = present_worker_state::Acquire;
+    pw.command_done = false;
+    pw.cv.notify_all();
+    pw.cv.wait(lock, [] { return pw.command_done; });
+    pw.owns_surface = true;
+    // Handing the window back and forth costs a glFinish each way; if some
+    // path did it every frame it would cost more than it saves. Make that
+    // visible in the log.
+    static unsigned acquisitions = 0;
+    ++acquisitions;
+    if (acquisitions <= 5 || acquisitions % 100 == 0)
+        std::fprintf(stderr, "RetroRun SDL threaded presentation: window handed to presenter (%u)\n",
+                     acquisitions);
+    return true;
+}
+
+// Main thread: take the window back (for the synchronous path, the SDL
+// renderer presenter, or teardown). Waits for every queued frame first.
+static void present_worker_release() {
+    if (!pw.owns_surface) return;
+    std::unique_lock<std::mutex> lock(pw.mutex);
+    pw.cv.wait(lock, [] { return !pw.job_pending && !pw.busy; });
+    pw.command = present_worker_state::Release;
+    pw.command_done = false;
+    pw.cv.notify_all();
+    pw.cv.wait(lock, [] { return pw.command_done; });
+    lock.unlock();
+    eglMakeCurrent(pw.dpy, pw.surface, pw.surface, pw.core_ctx);
+    pw.owns_surface = false;
+}
+
+// Main thread: pick the offscreen texture to compose the next frame into.
+static void present_worker_begin_frame(int width, int height) {
+    GLsync released = 0;
+    {
+        std::unique_lock<std::mutex> lock(pw.mutex);
+        const int slot = pw.next_slot;
+        pw.cv.wait(lock, [slot] { return !pw.slot_busy[slot]; });
+        released = pw.slot_release[slot];
+        pw.slot_release[slot] = 0;
+        pw.current_slot = slot;
+    }
+    // The presenter may still be reading this texture on the GPU; order our
+    // writes after its copy without blocking the CPU.
+    if (released) {
+        glWaitSync(released, 0, GL_TIMEOUT_IGNORED);
+        glDeleteSync(released);
+    }
+    if (pw.target_width != width || pw.target_height != height || !pw.target_fbo[0]) {
+        // Reallocating storage: nothing may be reading either texture.
+        {
+            std::unique_lock<std::mutex> lock(pw.mutex);
+            pw.cv.wait(lock, [] {
+                return !pw.job_pending && !pw.busy && !pw.slot_busy[0] && !pw.slot_busy[1];
+            });
+            for (int i = 0; i < 2; ++i) {
+                if (pw.slot_release[i]) {
+                    glWaitSync(pw.slot_release[i], 0, GL_TIMEOUT_IGNORED);
+                    glDeleteSync(pw.slot_release[i]);
+                    pw.slot_release[i] = 0;
+                }
+            }
+        }
+        GLint previous_texture = 0, previous_draw = 0;
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture);
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previous_draw);
+        for (int i = 0; i < 2; ++i) {
+            if (!pw.target_texture[i]) glGenTextures(1, &pw.target_texture[i]);
+            glBindTexture(GL_TEXTURE_2D, pw.target_texture[i]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA,
+                         GL_UNSIGNED_BYTE, NULL);
+            if (!pw.target_fbo[i]) glGenFramebuffers(1, &pw.target_fbo[i]);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, pw.target_fbo[i]);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                                   pw.target_texture[i], 0);
+        }
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous_texture));
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(previous_draw));
+        pw.target_width = width;
+        pw.target_height = height;
+    }
+    present_target_fbo = pw.target_fbo[pw.current_slot];
+}
+
+// Main thread: hand the composed frame to the presenter thread.
+static void present_worker_submit(uint64_t generation) {
+    GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+    std::unique_lock<std::mutex> lock(pw.mutex);
+    // At most one frame queued behind the one being presented.
+    pw.cv.wait(lock, [] { return !pw.job_pending; });
+    pw.job.slot = pw.current_slot;
+    pw.job.fence = fence;
+    pw.job.width = pw.target_width;
+    pw.job.height = pw.target_height;
+    pw.job.generation = generation;
+    pw.job_pending = true;
+    pw.slot_busy[pw.current_slot] = true;
+    pw.next_slot = pw.current_slot ^ 1;
+    pw.cv.notify_all();
+    present_target_fbo = 0;
+}
+
+static void present_worker_shutdown() {
+    if (!pw.started) return;
+    present_worker_release();
+    {
+        std::unique_lock<std::mutex> lock(pw.mutex);
+        pw.command = present_worker_state::Quit;
+        pw.command_done = false;
+        pw.cv.notify_all();
+        pw.cv.wait(lock, [] { return pw.command_done; });
+    }
+    pw.thread.join();
+    for (int i = 0; i < 2; ++i) {
+        if (pw.slot_release[i]) glDeleteSync(pw.slot_release[i]);
+        pw.slot_release[i] = 0;
+        if (pw.target_fbo[i]) glDeleteFramebuffers(1, &pw.target_fbo[i]);
+        if (pw.target_texture[i]) glDeleteTextures(1, &pw.target_texture[i]);
+        pw.target_fbo[i] = pw.target_texture[i] = 0;
+    }
+    pw.target_width = pw.target_height = 0;
+    if (pw.gl2) SDL_GL_DeleteContext(pw.gl2);
+    pw.gl2 = NULL;
+    pw.started = false;
+}
+#else
+static bool present_worker_wanted(rr_context_t*) { return false; }
+static bool present_worker_acquire(rr_context_t*) { return false; }
+static void present_worker_release() {}
+static void present_worker_begin_frame(int, int) {}
+static void present_worker_submit(uint64_t) {}
+static void present_worker_shutdown() {}
+#endif
+
 void rr_context_swap_buffers(rr_context_t* context, int source_width, int source_height,
                              int dest_x, int dest_y, int dest_width, int dest_height,
                              status* overlays, rr_rotation_t rotation) {
@@ -1454,6 +1819,7 @@ void rr_context_swap_buffers(rr_context_t* context, int source_width, int source
     rr_context_make_current(context);
 
     if (context->default_framebuffer) {
+        present_worker_release();
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         int drawable_width = context->display->width;
         int drawable_height = context->display->height;
@@ -1523,6 +1889,12 @@ void rr_context_swap_buffers(rr_context_t* context, int source_width, int source
     const int bottom = drawable_height - static_cast<int>((dest_y + dest_height) * scale_y);
     const int top = drawable_height - static_cast<int>(dest_y * scale_y);
 
+    const bool threaded = present_worker_wanted(context) && present_worker_acquire(context);
+    if (threaded)
+        present_worker_begin_frame(drawable_width, drawable_height);
+    else
+        present_worker_release();
+
     GLint previous_read = 0;
     GLint previous_draw = 0;
     GLint previous_program = 0;
@@ -1538,7 +1910,7 @@ void rr_context_swap_buffers(rr_context_t* context, int source_width, int source
     glActiveTexture(GL_TEXTURE0);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture);
     glGetIntegerv(GL_VIEWPORT, previous_viewport);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, present_target_fbo);
     glViewport(0, 0, drawable_width, drawable_height);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -1558,7 +1930,7 @@ void rr_context_swap_buffers(rr_context_t* context, int source_width, int source
         glBlitFramebuffer(0, 0, source_width, source_height,
                           left, bottom, right, top, GL_COLOR_BUFFER_BIT, filtering);
     }
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, present_target_fbo);
     if (decoration_overlay)
         blit_decoration_damage(context, overlays->decoration,
                                dest_x, dest_y, dest_width, dest_height,
@@ -1566,13 +1938,17 @@ void rr_context_swap_buffers(rr_context_t* context, int source_width, int source
     draw_overlays(context, overlays, dest_x, dest_y, dest_width, dest_height,
                   drawable_width, drawable_height, rotation);
     const uint64_t generation = benchmark_capture_generation();
-    const auto started = generation ? std::chrono::steady_clock::now()
-                                    : std::chrono::steady_clock::time_point{};
-    SDL_GL_SwapWindow(context->window);
-    if (generation)
-        benchmark_presentation_completed(BenchmarkPresentation::Fallback,
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - started).count(), generation);
+    if (threaded) {
+        present_worker_submit(generation);
+    } else {
+        const auto started = generation ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
+        SDL_GL_SwapWindow(context->window);
+        if (generation)
+            benchmark_presentation_completed(BenchmarkPresentation::Fallback,
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - started).count(), generation);
+    }
     glUseProgram(static_cast<GLuint>(previous_program));
     glBindVertexArray(static_cast<GLuint>(previous_vao));
     glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous_texture));
@@ -1638,8 +2014,23 @@ bool rr_video_vsync_set(bool enabled) {
     bool attempted = false;
     if (active_context && active_context->gl) {
         attempted = true;
-        SDL_GL_MakeCurrent(active_context->window, active_context->gl);
-        applied = SDL_GL_SetSwapInterval(enabled ? 1 : 0) == 0;
+#ifdef RR_SDL_GLES
+        if (pw.owns_surface) {
+            // The presenter thread holds the window; it applies the interval
+            // before its next swap.
+            std::lock_guard<std::mutex> lock(pw.mutex);
+            pw.swap_interval = enabled ? 1 : 0;
+            pw.swap_interval_dirty = true;
+            applied = true;
+        } else
+#endif
+        {
+            SDL_GL_MakeCurrent(active_context->window, active_context->gl);
+            applied = SDL_GL_SetSwapInterval(enabled ? 1 : 0) == 0;
+#ifdef RR_SDL_GLES
+            pw.swap_interval = enabled ? 1 : 0;
+#endif
+        }
     }
 #if SDL_VERSION_ATLEAST(2, 0, 18)
     if (active_presenter && active_presenter->renderer) {
