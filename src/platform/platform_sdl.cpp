@@ -122,8 +122,14 @@ static uint64_t next_surface_generation = 1;
 // on the synchronous path; an offscreen texture while threaded presentation
 // is active -- see present_worker below.
 static GLuint present_target_fbo = 0;
+// Audio actually handed to the device, for the threaded-presentation auto
+// mode: frames per second over the sample rate is the game's real speed.
+static std::atomic<uint64_t> audio_frames_submitted{0};
+static std::atomic<int> audio_sample_rate{0};
 static void present_worker_release();
 static void present_worker_shutdown();
+static void present_cadence_report();
+static unsigned long present_worker_dropped();
 
 static void refresh_display_size(rr_display_t* display) {
     if (!display || !display->window) return;
@@ -570,6 +576,7 @@ rr_audio_t* rr_audio_create(int frequency) {
                                         retrorun_audio_stable_buffer ? &obtained : NULL, 0);
     audio->volume = 100;
     audio->frequency = retrorun_audio_stable_buffer && audio->device ? obtained.freq : frequency;
+    audio_sample_rate.store(audio->frequency, std::memory_order_relaxed);
     audio->period_frames = retrorun_audio_stable_buffer && audio->device
         ? obtained.samples : wanted.samples;
     audio->started = !retrorun_audio_stable_buffer;
@@ -599,6 +606,7 @@ void rr_audio_destroy(rr_audio_t* audio) { if (audio) { if (audio->device) SDL_C
 void rr_audio_release_thread(rr_audio_t*) {}
 bool rr_audio_submit(rr_audio_t* audio, const short* data, int frames) {
     if (!audio || !audio->device || !data || frames <= 0 || audio->cancelled.load()) return false;
+    audio_frames_submitted.fetch_add(static_cast<uint64_t>(frames), std::memory_order_relaxed);
     const size_t samples = static_cast<size_t>(frames) * 2;
 
     // Preserve RetroRun's original SDL audio clock by default.
@@ -1264,6 +1272,7 @@ rr_context_t* rr_context_create(rr_display_t* display, int width, int height,
 void rr_context_destroy(rr_context_t* context) {
     if (!context) return;
     present_worker_shutdown();
+    present_cadence_report();
     if (active_context == context) active_context = NULL;
     if (context->gl) SDL_GL_MakeCurrent(context->window, context->gl);
     if (context->post_vbo) glDeleteBuffers(1, &context->post_vbo);
@@ -1463,6 +1472,63 @@ static void blit_decoration_damage(rr_context_t* context, rr_surface_t* surface,
     if (!scissor_was_enabled) glDisable(GL_SCISSOR_TEST);
 }
 
+// Presentation cadence (RETRORUN_PRESENT_STATS=1): the real interval between
+// frames reaching the screen, from whichever thread calls the swap. The
+// benchmark's frame time is the duration of retro_run() on the main thread;
+// with threaded presentation that no longer describes what is on screen, so
+// this is the metric that compares the two modes fairly. Printed at teardown.
+namespace {
+struct present_cadence {
+    int enabled = -1;
+    std::mutex mutex;
+    std::vector<uint32_t> intervals_us;
+    std::chrono::steady_clock::time_point last{};
+};
+present_cadence cadence;
+}
+static void present_cadence_report();
+// `collecting`: inside the benchmark window (same generation the benchmark
+// uses), so loading and warm-up frames don't pollute the distribution.
+static void present_cadence_mark(bool collecting) {
+    if (cadence.enabled == -1) {
+        const char* env = std::getenv("RETRORUN_PRESENT_STATS");
+        cadence.enabled = env && std::atoi(env) != 0;
+    }
+    if (!cadence.enabled) return;
+    const auto now = std::chrono::steady_clock::now();
+    bool report = false;
+    {
+        std::lock_guard<std::mutex> lock(cadence.mutex);
+        if (!collecting) {
+            cadence.last = {};
+            return;
+        }
+        if (cadence.last.time_since_epoch().count() != 0) {
+            cadence.intervals_us.push_back(static_cast<uint32_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(now - cadence.last).count()));
+            report = cadence.intervals_us.size() % 300 == 0;
+        }
+        cadence.last = now;
+    }
+    // The process may exit without tearing the context down; report as we go.
+    if (report) present_cadence_report();
+}
+static void present_cadence_report() {
+    std::lock_guard<std::mutex> lock(cadence.mutex);
+    if (cadence.enabled != 1 || cadence.intervals_us.size() < 10) return;
+    std::vector<uint32_t> v = cadence.intervals_us;
+    std::sort(v.begin(), v.end());
+    auto pct = [&](double q) { return v[static_cast<size_t>(q * (v.size() - 1))] / 1000.0; };
+    double sum = 0;
+    size_t over_25 = 0, over_40 = 0;
+    for (uint32_t x : v) { sum += x; if (x > 25000) ++over_25; if (x > 40000) ++over_40; }
+    std::fprintf(stderr,
+        "PRESENT_CADENCE frames=%zu avg_ms=%.2f p50=%.2f p90=%.2f p95=%.2f p99=%.2f max=%.2f "
+        "over25ms=%zu over40ms=%zu mailbox_replaced=%lu\n",
+        v.size() + 1, sum / v.size() / 1000.0, pct(.50), pct(.90), pct(.95), pct(.99),
+        v.back() / 1000.0, over_25, over_40, present_worker_dropped());
+}
+
 // ---------------------------------------------------------------------------
 // Threaded presentation (SDL2 + OpenGL ES, frontend-FBO mode).
 //
@@ -1485,10 +1551,16 @@ static void blit_decoration_damage(rr_context_t* context, rr_surface_t* surface,
 // the frontend FBO needs. No overlay/menu state crosses threads: only a
 // texture, a fence and a generation number do.
 //
-// Two textures ping-pong, and the main thread never gets more than one frame
-// ahead of the one being presented (backpressure on the job slot).
+// Two textures, mailbox style: a frame still waiting to be presented is
+// replaced by a newer one instead of being waited for, so the thread running
+// retro_run() is never paced by the display.
 //
-// Opt-in: RETRORUN_SDL_THREADED_PRESENT=1. The default-framebuffer
+// RETRORUN_SDL_THREADED_PRESENT=auto turns it on only while the game is below
+// real speed with the swap a large share of the frame (GPU-bound), and off
+// again once the game is at speed -- see present_worker_auto_update() for why
+// "always on" hurts games that already run at full speed. =1 forces it on
+// (for measurement), unset/0 keeps the synchronous path. RETRORUN_PRESENT_STATS=1
+// prints the on-screen frame cadence, the metric that compares both modes. The default-framebuffer
 // compatibility mode is never threaded (its cores draw to the window itself).
 // Anything else that needs the window on the main thread (the SDL_Renderer
 // presenter used for loading screens and software cores, context teardown)
@@ -1506,6 +1578,15 @@ struct present_job {
 struct present_worker_state {
     bool checked = false;
     bool enabled = false;
+    bool auto_mode = false;         // RETRORUN_SDL_THREADED_PRESENT=auto
+    bool auto_on = false;
+    std::chrono::steady_clock::time_point window_start{};
+    uint64_t window_audio_start = 0;
+    uint64_t window_swap_us = 0;    // swap time spent in the window
+    unsigned window_frames = 0;
+    int slow_windows = 0;
+    int fast_windows = 0;
+    std::atomic<uint64_t> worker_swap_us{0};
     bool failed = false;
     bool started = false;
     bool owns_surface = false;      // the presenter thread holds the window
@@ -1527,6 +1608,7 @@ struct present_worker_state {
     bool slot_busy[2] = {false, false};
     GLsync slot_release[2] = {0, 0};
     int next_slot = 0;
+    unsigned long dropped = 0;      // frames replaced before reaching the screen
     // main-thread (core context) side
     GLuint target_texture[2] = {0, 0};
     GLuint target_fbo[2] = {0, 0};
@@ -1611,10 +1693,12 @@ static void present_worker_thread() {
 
         const auto started = std::chrono::steady_clock::now();
         SDL_GL_SwapWindow(pw.window);
+        present_cadence_mark(job.generation != 0);
+        const uint64_t swap_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count());
+        pw.worker_swap_us.fetch_add(swap_us, std::memory_order_relaxed);
         if (job.generation)
-            benchmark_presentation_completed(BenchmarkPresentation::Fallback,
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - started).count(), job.generation);
+            benchmark_presentation_completed(BenchmarkPresentation::Fallback, swap_us, job.generation);
 
         lock.lock();
         pw.busy = false;
@@ -1626,11 +1710,69 @@ static bool present_worker_wanted(rr_context_t* context) {
     if (!pw.checked) {
         pw.checked = true;
         const char* env = std::getenv("RETRORUN_SDL_THREADED_PRESENT");
-        pw.enabled = env && std::atoi(env) != 0;
+        pw.auto_mode = env && std::strcmp(env, "auto") == 0;
+        pw.enabled = pw.auto_mode || (env && std::atoi(env) != 0);
         if (pw.enabled)
-            std::fprintf(stderr, "RetroRun SDL threaded presentation requested\n");
+            std::fprintf(stderr, "RetroRun SDL threaded presentation requested (%s)\n",
+                         pw.auto_mode ? "auto" : "always");
     }
-    return pw.enabled && !pw.failed && context && !context->default_framebuffer;
+    if (!pw.enabled || pw.failed || !context || context->default_framebuffer) return false;
+    return pw.auto_mode ? pw.auto_on : true;
+}
+
+// Auto mode, main thread, once per presented frame. Measured on an
+// RG351MP-class device: threaded presentation is a large win only when the
+// GPU is the bottleneck (Shenmue: 17 -> 21 fps, game speed 57% -> 70%). In a
+// game already at full speed it makes things worse: with vsync off, the
+// synchronous swap was what paced retro_run() evenly; without it the loop is
+// paced only by audio backpressure, runs in bursts, and both the on-screen
+// cadence and the audio stutter (KOF XI: frames over 25ms 30 -> 62-103,
+// audio deliveries late by >10ms 37 -> 323-465). So: go threaded only while
+// the game is below real speed AND the swap is a big share of the frame; go
+// back to synchronous once the game is at speed again. The gap between the
+// two thresholds keeps it from flapping.
+static void present_worker_auto_update(bool threaded_now, uint64_t sync_swap_us) {
+    if (!pw.auto_mode) return;
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t audio_now = audio_frames_submitted.load(std::memory_order_relaxed);
+    if (pw.window_start.time_since_epoch().count() == 0) {
+        pw.window_start = now;
+        pw.window_audio_start = audio_now;
+        pw.window_swap_us = 0;
+        pw.window_frames = 0;
+        pw.worker_swap_us.store(0);
+        return;
+    }
+    pw.window_frames++;
+    pw.window_swap_us += sync_swap_us;
+    const double elapsed = std::chrono::duration<double>(now - pw.window_start).count();
+    if (elapsed < 2.0 || pw.window_frames < 30) return;
+
+    const int rate = audio_sample_rate.load(std::memory_order_relaxed);
+    const double speed = rate > 0 ? (audio_now - pw.window_audio_start) / (rate * elapsed) : 1.0;
+    const uint64_t swap_us = pw.window_swap_us + pw.worker_swap_us.exchange(0);
+    const double swap_share = swap_us / (elapsed * 1e6);
+    if (!threaded_now) {
+        pw.slow_windows = (speed < 0.93 && swap_share > 0.30) ? pw.slow_windows + 1 : 0;
+        if (pw.slow_windows >= 2) {
+            pw.auto_on = true;
+            pw.slow_windows = 0;
+            std::fprintf(stderr, "RetroRun SDL threaded presentation: auto ON "
+                         "(speed %.0f%%, swap %.0f%% of the frame)\n", speed * 100, swap_share * 100);
+        }
+    } else {
+        pw.fast_windows = speed > 0.99 ? pw.fast_windows + 1 : 0;
+        if (pw.fast_windows >= 3) {
+            pw.auto_on = false;
+            pw.fast_windows = 0;
+            std::fprintf(stderr, "RetroRun SDL threaded presentation: auto OFF "
+                         "(speed %.0f%%)\n", speed * 100);
+        }
+    }
+    pw.window_start = now;
+    pw.window_audio_start = audio_now;
+    pw.window_swap_us = 0;
+    pw.window_frames = 0;
 }
 
 // Main thread: give the window to the presenter thread.
@@ -1709,14 +1851,35 @@ static void present_worker_release() {
 // Main thread: pick the offscreen texture to compose the next frame into.
 static void present_worker_begin_frame(int width, int height) {
     GLsync released = 0;
+    GLsync dropped_fence = 0;
     {
         std::unique_lock<std::mutex> lock(pw.mutex);
-        const int slot = pw.next_slot;
-        pw.cv.wait(lock, [slot] { return !pw.slot_busy[slot]; });
+        // Mailbox: never wait for the presenter's swap. A slot is either
+        // free, holding the frame queued for presentation (pending), or being
+        // copied to the window by the presenter. Take a free one; failing that,
+        // take back the queued frame -- it is about to be superseded by this
+        // one anyway. Only a slot mid-copy is waited for, and the presenter
+        // releases it as soon as the copy is issued (before its swap).
+        int slot = -1;
+        for (;;) {
+            const int preferred = pw.next_slot;
+            if (!pw.slot_busy[preferred]) { slot = preferred; break; }
+            if (!pw.slot_busy[preferred ^ 1]) { slot = preferred ^ 1; break; }
+            if (pw.job_pending) {
+                slot = pw.job.slot;
+                dropped_fence = pw.job.fence;
+                pw.job_pending = false;
+                pw.slot_busy[slot] = false;
+                ++pw.dropped;
+                break;
+            }
+            pw.cv.wait(lock);
+        }
         released = pw.slot_release[slot];
         pw.slot_release[slot] = 0;
         pw.current_slot = slot;
     }
+    if (dropped_fence) glDeleteSync(dropped_fence);
     // The presenter may still be reading this texture on the GPU; order our
     // writes after its copy without blocking the CPU.
     if (released) {
@@ -1766,8 +1929,17 @@ static void present_worker_submit(uint64_t generation) {
     GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     glFlush();
     std::unique_lock<std::mutex> lock(pw.mutex);
-    // At most one frame queued behind the one being presented.
-    pw.cv.wait(lock, [] { return !pw.job_pending; });
+    // Mailbox: a frame still waiting to be presented is replaced by this
+    // newer one rather than waited for, so this thread -- which also runs
+    // retro_run() and delivers the core's audio -- is never paced by the
+    // display. Waiting here made retro_run() alternate between ~15ms and
+    // ~33ms in a 60fps game and the audio arrive in bursts.
+    if (pw.job_pending) {
+        glDeleteSync(pw.job.fence);
+        pw.slot_busy[pw.job.slot] = false;
+        pw.job_pending = false;
+        ++pw.dropped;
+    }
     pw.job.slot = pw.current_slot;
     pw.job.fence = fence;
     pw.job.width = pw.target_width;
@@ -1803,7 +1975,13 @@ static void present_worker_shutdown() {
     pw.gl2 = NULL;
     pw.started = false;
 }
+static unsigned long present_worker_dropped() {
+    std::lock_guard<std::mutex> lock(pw.mutex);
+    return pw.dropped;
+}
 #else
+static void present_worker_auto_update(bool, uint64_t) {}
+static unsigned long present_worker_dropped() { return 0; }
 static bool present_worker_wanted(rr_context_t*) { return false; }
 static bool present_worker_acquire(rr_context_t*) { return false; }
 static void present_worker_release() {}
@@ -1940,14 +2118,16 @@ void rr_context_swap_buffers(rr_context_t* context, int source_width, int source
     const uint64_t generation = benchmark_capture_generation();
     if (threaded) {
         present_worker_submit(generation);
+        present_worker_auto_update(true, 0);
     } else {
-        const auto started = generation ? std::chrono::steady_clock::now()
-                                        : std::chrono::steady_clock::time_point{};
+        const auto started = std::chrono::steady_clock::now();
         SDL_GL_SwapWindow(context->window);
+        present_cadence_mark(generation != 0);
+        const uint64_t swap_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count());
         if (generation)
-            benchmark_presentation_completed(BenchmarkPresentation::Fallback,
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - started).count(), generation);
+            benchmark_presentation_completed(BenchmarkPresentation::Fallback, swap_us, generation);
+        present_worker_auto_update(false, swap_us);
     }
     glUseProgram(static_cast<GLuint>(previous_program));
     glBindVertexArray(static_cast<GLuint>(previous_vao));
