@@ -1588,6 +1588,11 @@ struct present_worker_state {
     unsigned window_frames = 0;
     int slow_windows = 0;
     int fast_windows = 0;
+    // Under vsync: FIFO while the game keeps real speed, mailbox when it
+    // can't (see present_worker_auto_update).
+    bool vsync_fifo = true;
+    int fifo_slow_windows = 0;
+    int fifo_fast_windows = 0;
     std::atomic<uint64_t> worker_swap_us{0};
     bool failed = false;
     bool started = false;
@@ -1734,7 +1739,7 @@ static bool present_worker_wanted(rr_context_t* context) {
 // back to synchronous once the game is at speed again. The gap between the
 // two thresholds keeps it from flapping.
 static void present_worker_auto_update(bool threaded_now, uint64_t sync_swap_us) {
-    if (!pw.auto_mode) return;
+    if (!pw.auto_mode && !threaded_now) return;
     const auto now = std::chrono::steady_clock::now();
     const uint64_t audio_now = audio_frames_submitted.load(std::memory_order_relaxed);
     if (pw.window_start.time_since_epoch().count() == 0) {
@@ -1754,7 +1759,35 @@ static void present_worker_auto_update(bool threaded_now, uint64_t sync_swap_us)
     const double speed = rate > 0 ? (audio_now - pw.window_audio_start) / (rate * elapsed) : 1.0;
     const uint64_t swap_us = pw.window_swap_us + pw.worker_swap_us.exchange(0);
     const double swap_share = swap_us / (elapsed * 1e6);
-    if (!threaded_now) {
+    if (threaded_now) {
+        // Vsync + FIFO paces retro_run() at the refresh rate -- perfect for a
+        // game that holds 60, but a game that needs ~35ms per frame gets
+        // rounded up to 3 vblanks (50ms) and runs in slow motion. Measured:
+        // Metal Slug 6 boss 25.5 fps at 99.7% speed synchronous -> 19.8 fps
+        // at 66% speed with vsync + FIFO. Below real speed, switch to
+        // mailbox: the display still flips on vblank (no tearing), but the
+        // emulation is never held back by it.
+        if (pw.vsync_fifo) {
+            pw.fifo_slow_windows = speed < 0.95 ? pw.fifo_slow_windows + 1 : 0;
+            if (pw.fifo_slow_windows >= 2) {
+                pw.vsync_fifo = false;
+                pw.fifo_slow_windows = 0;
+                std::fprintf(stderr, "RetroRun SDL threaded presentation: mailbox (speed %.0f%%)\n",
+                             speed * 100);
+            }
+        } else {
+            pw.fifo_fast_windows = speed > 0.99 ? pw.fifo_fast_windows + 1 : 0;
+            if (pw.fifo_fast_windows >= 3) {
+                pw.vsync_fifo = true;
+                pw.fifo_fast_windows = 0;
+                std::fprintf(stderr, "RetroRun SDL threaded presentation: fifo (speed %.0f%%)\n",
+                             speed * 100);
+            }
+        }
+    }
+    if (!pw.auto_mode) {
+        // nothing else to decide
+    } else if (!threaded_now) {
         pw.slow_windows = (speed < 0.93 && swap_share > 0.30) ? pw.slow_windows + 1 : 0;
         if (pw.slow_windows >= 2) {
             pw.auto_on = true;
@@ -1871,7 +1904,7 @@ static void present_worker_begin_frame(int width, int height) {
             // (it frees at the next vblank) so retro_run() is paced at the
             // refresh rate. Without vsync there is no clock to follow:
             // mailbox, take the queued frame back.
-            if (pw.job_pending && pw.swap_interval == 0) {
+            if (pw.job_pending && (pw.swap_interval == 0 || !pw.vsync_fifo)) {
                 slot = pw.job.slot;
                 dropped_fence = pw.job.fence;
                 pw.job_pending = false;
@@ -1940,7 +1973,7 @@ static void present_worker_submit(uint64_t generation) {
     // retro_run() and delivers the core's audio -- is never paced by the
     // display. Waiting here made retro_run() alternate between ~15ms and
     // ~33ms in a 60fps game and the audio arrive in bursts.
-    if (pw.swap_interval != 0) {
+    if (pw.swap_interval != 0 && pw.vsync_fifo) {
         // FIFO under vsync: wait for the presenter to take the queued frame.
         pw.cv.wait(lock, [] { return !pw.job_pending; });
     } else if (pw.job_pending) {
