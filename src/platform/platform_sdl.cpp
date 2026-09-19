@@ -1551,9 +1551,11 @@ static void present_cadence_report() {
 // the frontend FBO needs. No overlay/menu state crosses threads: only a
 // texture, a fence and a generation number do.
 //
-// Two textures, mailbox style: a frame still waiting to be presented is
-// replaced by a newer one instead of being waited for, so the thread running
-// retro_run() is never paced by the display.
+// Two textures. With vsync off: mailbox -- a frame still waiting to be
+// presented is replaced by a newer one instead of being waited for, since
+// there is no display clock to follow. With vsync on: FIFO -- the thread
+// running retro_run() waits for a slot, which frees at each vblank, so it is
+// paced by the display instead of carrying the GPU wait itself.
 //
 // RETRORUN_SDL_THREADED_PRESENT=auto turns it on only while the game is below
 // real speed with the swap a large share of the frame (GPU-bound), and off
@@ -1865,7 +1867,11 @@ static void present_worker_begin_frame(int width, int height) {
             const int preferred = pw.next_slot;
             if (!pw.slot_busy[preferred]) { slot = preferred; break; }
             if (!pw.slot_busy[preferred ^ 1]) { slot = preferred ^ 1; break; }
-            if (pw.job_pending) {
+            // With vsync the display is the clock: FIFO, wait for a slot
+            // (it frees at the next vblank) so retro_run() is paced at the
+            // refresh rate. Without vsync there is no clock to follow:
+            // mailbox, take the queued frame back.
+            if (pw.job_pending && pw.swap_interval == 0) {
                 slot = pw.job.slot;
                 dropped_fence = pw.job.fence;
                 pw.job_pending = false;
@@ -1934,7 +1940,10 @@ static void present_worker_submit(uint64_t generation) {
     // retro_run() and delivers the core's audio -- is never paced by the
     // display. Waiting here made retro_run() alternate between ~15ms and
     // ~33ms in a 60fps game and the audio arrive in bursts.
-    if (pw.job_pending) {
+    if (pw.swap_interval != 0) {
+        // FIFO under vsync: wait for the presenter to take the queued frame.
+        pw.cv.wait(lock, [] { return !pw.job_pending; });
+    } else if (pw.job_pending) {
         glDeleteSync(pw.job.fence);
         pw.slot_busy[pw.job.slot] = false;
         pw.job_pending = false;
