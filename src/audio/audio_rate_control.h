@@ -9,12 +9,13 @@
 //
 //   ratio = 1 / measured game speed      (long slow sections: the music just
 //                                          plays slower, like a tape)
-//         * (1 + gain * queue error)     (small deviations: +-1% around half
+//         * (1 + gain * queue error)     (small deviations: +-1% around 85% of
 //                                          the target queue level)
 //
 // The game speed is the frames the core produced per second of real time,
 // smoothed over ~0.7 s, not counting the time the backend itself blocked the
-// producer (backpressure), so a full queue never looks like a slow game.
+// producer (backpressure), so a full queue never looks like a slow game, and
+// ignoring gaps over 0.15 s (savestate load, freezes: not a slow game either).
 // The resampler is Catmull-Rom with state carried across chunks (no seams).
 //
 // Environment: RETRORUN_AUDIO_RATE_CONTROL=0 disables it;
@@ -37,8 +38,10 @@ public:
         enabled_ = env_int("RETRORUN_AUDIO_RATE_CONTROL", 1, 0, 1) != 0;
         max_ratio_ = 100.0 / env_int("RETRORUN_AUDIO_MIN_SPEED_PERCENT", 50, 10, 100);
         gain_ = env_int("RETRORUN_AUDIO_DRC_PERMILLE", 10, 0, 50) / 1000.0;
+        // perto do teto da fila (a contrapressao segura em target_queue_ms):
+        // a 100% a fila fica ali e a correcao fina quase nao age (~0,2%)
         target_frames_ = static_cast<double>(frequency) *
-            std::max(20, target_queue_ms / 2) / 1000.0;
+            std::max(20, target_queue_ms * 85 / 100) / 1000.0;
         reset();
         std::fprintf(stderr,
             "RetroRun audio rate control: %s, min_speed=%.0f%%, drc=%.1f%%, target=%.0f frames\n",
@@ -67,13 +70,22 @@ public:
                 std::chrono::steady_clock::time_point call_start) {
         if (last_end_.time_since_epoch().count() != 0) {
             double dt = std::chrono::duration<double>(call_start - last_end_).count();
-            dt = std::clamp(dt, 0.0, 0.25);
+            // um buraco longo sem audio (carga de savestate, travada) nao e
+            // jogo lento: nao entra na media, senao a musica sai em camera lenta
+            if (dt > kStallSeconds) {
+                break_measurement();
+                dt = -1.0;
+            }
+            dt = std::max(dt, 0.0);
             const double decay = std::exp(-dt / kSpeedTauSeconds);
-            speed_frames_ = speed_frames_ * decay + frames;
-            speed_seconds_ = speed_seconds_ * decay + dt;
+            if (last_end_.time_since_epoch().count() != 0) {
+                speed_frames_ = speed_frames_ * decay + frames;
+                speed_seconds_ = speed_seconds_ * decay + dt;
+            }
         }
         double base = 1.0;
-        if (speed_seconds_ > 0.15 && frequency_ > 0) {
+        // so depois de ~0,5 s de medicao (logo apos a carga a producao sai aos trancos)
+        if (speed_seconds_ > 0.5 && frequency_ > 0) {
             const double speed = speed_frames_ / (speed_seconds_ * frequency_);
             base = 1.0 / std::clamp(speed, 1.0 / max_ratio_, 1.0);
         }
@@ -170,6 +182,7 @@ public:
 
 private:
     static constexpr double kSpeedTauSeconds = 0.7;
+    static constexpr double kStallSeconds = 0.15;
 
     static int env_int(const char* name, int fallback, int lo, int hi) {
         const char* value = std::getenv(name);
