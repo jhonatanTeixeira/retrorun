@@ -22,7 +22,7 @@ constexpr const char *CatalogFilename = "flycast-game-catalog.ini";
 
 const char *BuiltinCatalogText = R"catalog(
 schema_version = 3
-catalog_version = 20261001
+catalog_version = 20261003
 
 default.retrorun_vsync = false
 default.retrorun_loop_declared_fps = true

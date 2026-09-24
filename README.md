@@ -9,6 +9,14 @@ systems. It was originally designed for Anbernic devices using the GO2/DRM
 graphics stack and now provides a platform abstraction for input, audio and
 video, with an additional SDL2 backend for macOS and Linux.
 
+## Version 3.2.1
+
+- Fix bezel alignment, transparency and rotated display viewports.
+- Improve Flycast LE option handling and video geometry.
+- Share Flycast profiles by Rockchip SoC and align Soul Calibur profiles across RG351 devices.
+
+See [changelog.txt](changelog.txt) for release history.
+
 ## Highlights
 
 - **Save states:** create and load states from the on-screen menu or controller
@@ -61,13 +69,6 @@ and distributions.
 
 - [Changelog](changelog.txt)
 - [Porting guide](PORTING.md)
-- [Benchmark and remote validation runbook](doc/BENCHMARK_IMPLEMENTATION_RUNBOOK.md)
-- [RG353M benchmark summary](doc/BENCHMARK_RG353M_RESULTS.md)
-- [RG353M dArkOS stack comparison](doc/BENCHMARK_RG353M_DARKOS_COMPARISON.md)
-- [RG353M Flycast new-lever validation](doc/BENCHMARK_RG353M_NEW_LEVERS_20260909.md)
-- [RG353M SDL2 rendering investigation](doc/SDL2_RG353M_RENDERING_INVESTIGATION.md)
-- [Flycast 2021 RK3326 optimization handoff](doc/FLYCAST2021_RK3326_OPTIMIZATION_HANDOFF.md)
-- [Project TODO](doc/TODO.txt)
 
 ### Artwork attribution
 

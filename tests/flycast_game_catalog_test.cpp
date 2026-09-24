@@ -76,7 +76,7 @@ void testBuiltInProfiles()
 {
     const Catalog catalog = builtinCatalog();
     assert(catalog.schema_version == 3);
-    assert(catalog.catalog_version == 20261001);
+    assert(catalog.catalog_version == 20261003);
     assert(catalog.profiles.size() == 98);
     assert(catalog.chip_profiles.size() == 3);
     assert(catalog.device_profiles.empty());
@@ -1606,6 +1606,30 @@ void testChipDetectionAndFamilySelection()
     assertSameProfile(reference, candidate);
 }
 
+void testRg351SoulProfilesMatch()
+{
+    const Catalog catalog = builtinCatalog();
+    for (const char *product : {"T1401N", "T1401D50", "T1401M"})
+    {
+        for (Mode mode : {Mode::BestPerformance, Mode::BestValidated})
+        {
+            Profile reference;
+            bool referenceFallback = false;
+            assert(selectProfile(catalog, product, mode, reference,
+                                 referenceFallback, "RG351V"));
+            for (const char *device : {"RG351P", "RG351MP", "RG351M"})
+            {
+                Profile candidate;
+                bool fallback = false;
+                assert(selectProfile(catalog, product, mode, candidate,
+                                     fallback, device));
+                assert(fallback == referenceFallback);
+                assertSameProfile(reference, candidate);
+            }
+        }
+    }
+}
+
 void testDeviceOverrideWinsOverChipProfile()
 {
     std::istringstream input(
@@ -1681,6 +1705,7 @@ void testInvalidCatalogIsRejected()
 int main()
 {
     testBuiltInProfiles();
+    testRg351SoulProfilesMatch();
     testVersionedRepositoryCatalogMatchesBuiltIn();
     testExternalCatalogParsing();
     testChipDetectionAndFamilySelection();

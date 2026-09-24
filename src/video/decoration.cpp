@@ -1,4 +1,5 @@
 #include "decoration.h"
+#include "decoration-viewport.h"
 
 #include "config.h"
 #include "globals.h"
@@ -112,14 +113,9 @@ DecorationLayout rotate_layout_from_display(const DecorationLayout& physical) {
 }
 
 void decoration_canvas_size(int* width, int* height) {
+    // The rotated layout is expressed in native framebuffer coordinates.
     *width = rr_display_width_get(display);
     *height = rr_display_height_get(display);
-#ifndef RR_PLATFORM_SDL
-    const rr_rotation_t rotation = getRotation();
-    if (rotation == RR_ROTATION_DEGREES_90 ||
-        rotation == RR_ROTATION_DEGREES_270)
-        std::swap(*width, *height);
-#endif
 }
 
 bool value_true(const std::string& value) {
@@ -372,11 +368,31 @@ void load_distribution_viewport() {
     if (!value("custom_viewport_x", &x) || !value("custom_viewport_y", &y) ||
         !value("custom_viewport_width", &width) ||
         !value("custom_viewport_height", &height)) return;
-    const int display_width = rr_display_width_get(display);
-    const int display_height = rr_display_height_get(display);
-    if (display_width <= 0 || display_height <= 0 || x < 0 || y < 0 ||
-        width <= 0 || height <= 0 || x + width > display_width ||
-        y + height > display_height) {
+    int display_width = rr_display_width_get(display);
+    int display_height = rr_display_height_get(display);
+#ifndef RR_PLATFORM_SDL
+    // RetroArch's viewport uses the visible canvas, before mapping it onto
+    // a portrait-mounted panel such as the RG351P's 320x480 framebuffer.
+    if (rotation_swaps_axes(getRotation()))
+        std::swap(display_width, display_height);
+#endif
+    const auto base_settings = read_settings("/storage/.config/retroarch/retroarch.cfg");
+    const auto bias = [&settings, &base_settings](const char* key) {
+        const auto override_value = settings.find(key);
+        const auto base_value = base_settings.find(key);
+        if (override_value == settings.end() && base_value == base_settings.end())
+            return 0.5;
+        const std::string& text = override_value != settings.end()
+            ? override_value->second : base_value->second;
+        char* end = nullptr;
+        const double parsed = std::strtod(text.c_str(), &end);
+        return end != text.c_str() && *end == '\0' && std::isfinite(parsed) &&
+               parsed >= 0.0 && parsed <= 1.0 ? parsed : 0.5;
+    };
+    if (!rr::decoration_viewport_position(display_width, display_height,
+                                          width, height, &x, &y,
+                                          bias("video_vp_bias_x"),
+                                          bias("video_vp_bias_y"))) {
         logger.log(Logger::WARN,
                    "Distribution decoration viewport ignored: x=%d, y=%d, w=%d, h=%d",
                    x, y, width, height);
@@ -655,11 +671,8 @@ bool decoration_game_viewport(int* x, int* y, int* width, int* height) {
     // rectangle inside it and preserve that aspect ratio.
     double game_aspect = *height > 0
         ? static_cast<double>(*width) / *height : 1.0;
-    // The viewport is stored in the presenter's pre-rotation coordinate
-    // system. A landscape core is therefore portrait in that system (and vice
-    // versa); use the inverse ratio before fitting it into the bezel opening.
-    if (rotation_swaps_axes(getRotation()) && game_aspect > 0.0)
-        game_aspect = 1.0 / game_aspect;
+    // prepareScreen has already oriented the game rectangle for the panel;
+    // inverting it again would distort games on rotated handheld screens.
     const double viewport_aspect = static_cast<double>(viewport_width) / viewport_height;
     int fitted_width = viewport_width;
     int fitted_height = viewport_height;
