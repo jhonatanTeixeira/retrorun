@@ -1,3 +1,4 @@
+#include "audio_rate_control.h"
 #include "platform.h"
 #include "globals.h"
 #include "input.h"
@@ -41,6 +42,7 @@ struct rr_input_state {
 };
 struct rr_audio {
     SDL_AudioDeviceID device;
+    AudioRateControl rate;	// src/audio/audio_rate_control.h
     std::atomic<int> volume;
     int frequency;
     int period_frames;
@@ -587,6 +589,7 @@ rr_audio_t* rr_audio_create(int frequency) {
     audio->frames_dropped = 0;
     audio->max_queue_depth = 0;
     audio->silence_buffer.assign(static_cast<size_t>(audio->period_frames) * 2, 0);
+    audio->rate.configure(audio->frequency, retrorun_audio_stable_buffer ? 140 : 80);
     if (audio->device) {
         std::fprintf(stderr,
                      "RetroRun SDL audio: driver=%s, stable_buffer=%s, frequency=%d, samples=%d\n",
@@ -602,12 +605,13 @@ rr_audio_t* rr_audio_create(int frequency) {
     }
     return audio;
 }
-void rr_audio_destroy(rr_audio_t* audio) { if (audio) { if (audio->device) SDL_CloseAudioDevice(audio->device); delete audio; } }
+void rr_audio_destroy(rr_audio_t* audio) { if (audio) { audio->rate.report(); if (audio->device) SDL_CloseAudioDevice(audio->device); delete audio; } }
 void rr_audio_release_thread(rr_audio_t*) {}
 bool rr_audio_submit(rr_audio_t* audio, const short* data, int frames) {
     if (!audio || !audio->device || !data || frames <= 0 || audio->cancelled.load()) return false;
     audio_frames_submitted.fetch_add(static_cast<uint64_t>(frames), std::memory_order_relaxed);
-    const size_t samples = static_cast<size_t>(frames) * 2;
+    const auto call_start = std::chrono::steady_clock::now();
+    size_t samples = static_cast<size_t>(frames) * 2;
 
     // Preserve RetroRun's original SDL audio clock by default.
     const Uint32 bytes_per_ms = static_cast<Uint32>(audio->frequency * 2 * sizeof(short) / 1000);
@@ -645,6 +649,11 @@ bool rr_audio_submit(rr_audio_t* audio, const short* data, int frames) {
     }
     if (audio->cancelled.load(std::memory_order_relaxed)) return false;
 
+    if (audio->rate.enabled()) {
+        const int out = audio->rate.process(data, frames, queued / (2 * sizeof(short)), call_start);
+        data = audio->rate.output();
+        samples = static_cast<size_t>(out) * 2;
+    }
     const int volume = audio->volume.load(std::memory_order_relaxed);
     if (volume >= 100) {
         SDL_QueueAudio(audio->device, data, static_cast<Uint32>(samples * sizeof(short)));
@@ -655,6 +664,7 @@ bool rr_audio_submit(rr_audio_t* audio, const short* data, int frames) {
         SDL_QueueAudio(audio->device, audio->mix_buffer.data(),
                        static_cast<Uint32>(audio->mix_buffer.size() * sizeof(short)));
     }
+    audio->rate.submitted();
     if (retrorun_audio_stable_buffer && !audio->started) {
         audio->started = true;
         SDL_PauseAudioDevice(audio->device, 0);
@@ -662,8 +672,8 @@ bool rr_audio_submit(rr_audio_t* audio, const short* data, int frames) {
     return true;
 }
 bool rr_audio_valid(rr_audio_t* audio) { return audio && audio->device != 0; }
-void rr_audio_flush(rr_audio_t* audio) { if (audio && audio->device) { SDL_ClearQueuedAudio(audio->device); audio->started = !retrorun_audio_stable_buffer; } }
-void rr_audio_pause(rr_audio_t* audio, bool paused) { if (audio && audio->device) { audio->paused.store(paused); SDL_PauseAudioDevice(audio->device, paused ? 1 : 0); } }
+void rr_audio_flush(rr_audio_t* audio) { if (audio && audio->device) { SDL_ClearQueuedAudio(audio->device); audio->rate.reset(); audio->started = !retrorun_audio_stable_buffer; } }
+void rr_audio_pause(rr_audio_t* audio, bool paused) { if (audio && audio->device) { audio->paused.store(paused); audio->rate.break_measurement(); SDL_PauseAudioDevice(audio->device, paused ? 1 : 0); } }
 void rr_audio_cancel(rr_audio_t* audio) { if (audio) audio->cancelled.store(true); }
 void rr_audio_diagnostics_get(rr_audio_t* audio, rr_audio_diagnostics_t* diagnostics) {
     if (!diagnostics) return;
@@ -673,6 +683,7 @@ void rr_audio_diagnostics_get(rr_audio_t* audio, rr_audio_diagnostics_t* diagnos
     diagnostics->buffer_overruns = audio->overruns.load();
     diagnostics->frames_dropped = audio->frames_dropped.load();
     diagnostics->max_queue_depth = audio->max_queue_depth.load();
+    diagnostics->adaptive_stretch_frames = audio->rate.frames_added;
 }
 uint32_t rr_audio_volume_get(rr_audio_t* audio, const char*) { return audio ? audio->volume.load(std::memory_order_relaxed) : 0; }
 void rr_audio_volume_set(rr_audio_t* audio, uint32_t value, const char*) { if (audio) audio->volume.store(std::min<uint32_t>(value, 100), std::memory_order_relaxed); }

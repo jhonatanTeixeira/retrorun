@@ -1,11 +1,13 @@
 #include "audio_backend.h"
 
 #include "globals.h"
+#include "audio_rate_control.h"
 
 #include <SDL.h>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -38,6 +40,7 @@ struct sdl_audio {
     std::atomic<uint64_t> queue_low_observations{0};
     std::atomic<uint64_t> adaptive_stretch_frames{0};
     bool submitted_once = false;
+    AudioRateControl rate;	// audio_rate_control.h
     std::vector<short> mix_buffer;
     std::vector<short> stretch_buffer;
     std::vector<short> silence_buffer;
@@ -108,6 +111,7 @@ void* create(int frequency) {
         static_cast<uint64_t>(audio->stretch_low_ms) / 1000;
     audio->started = !retrorun_audio_stable_buffer && audio->prefill_frames == 0;
     audio->silence_buffer.assign(static_cast<size_t>(audio->period_frames) * 2, 0);
+    audio->rate.configure(audio->frequency, audio->target_queue_ms);
 
     std::fprintf(stderr,
         "RetroRun hybrid audio: backend=sdl2, driver=%s, stable_buffer=%s, "
@@ -126,6 +130,7 @@ void destroy(void* handle) {
     sdl_audio* audio = static_cast<sdl_audio*>(handle);
     if (!audio)
         return;
+    audio->rate.report();
     if (audio->device)
         SDL_CloseAudioDevice(audio->device);
     delete audio;
@@ -137,6 +142,7 @@ bool submit(void* handle, const short* data, int frames) {
         audio->cancelled.load(std::memory_order_relaxed))
         return false;
 
+    const auto call_start = std::chrono::steady_clock::now();
     const size_t samples = static_cast<size_t>(frames) * 2;
     const Uint32 bytes_per_ms = static_cast<Uint32>(
         audio->frequency * 2 * sizeof(short) / 1000);
@@ -201,7 +207,11 @@ bool submit(void* handle, const short* data, int frames) {
     const short* queue_data = data;
     int queue_frames = frames;
     size_t queue_samples = samples;
-    if (audio->stretch_percent > 0 && audio->started &&
+    if (audio->rate.enabled()) {
+        queue_frames = audio->rate.process(data, frames, queued / (2 * sizeof(short)), call_start);
+        queue_samples = static_cast<size_t>(queue_frames) * 2;
+        queue_data = audio->rate.output();
+    } else if (audio->stretch_percent > 0 && audio->started &&
         queued_frames < audio->stretch_low_frames &&
         !audio->paused.load(std::memory_order_relaxed)) {
         queue_frames = frames + std::max(1,
@@ -250,6 +260,7 @@ bool submit(void* handle, const short* data, int frames) {
         return false;
     }
     audio->submitted_once = true;
+    audio->rate.submitted();
 
     const uint64_t queued_after = SDL_GetQueuedAudioSize(audio->device) /
         (2 * sizeof(short));
@@ -275,6 +286,7 @@ void flush(void* handle) {
     if (!audio || !audio->device)
         return;
     SDL_ClearQueuedAudio(audio->device);
+    audio->rate.reset();
     audio->started = !retrorun_audio_stable_buffer && audio->prefill_frames == 0;
     audio->submitted_once = false;
     if (!audio->started)
@@ -285,6 +297,7 @@ void pause(void* handle, bool paused) {
     if (!audio || !audio->device)
         return;
     audio->paused.store(paused, std::memory_order_relaxed);
+    audio->rate.break_measurement();
     if (paused) {
         SDL_PauseAudioDevice(audio->device, 1);
     } else if (audio->started) {
@@ -314,7 +327,7 @@ void diagnostics_get(void* handle, rr_audio_diagnostics_t* diagnostics) {
     diagnostics->queue_depth_total_frames = audio->queue_depth_total_frames.load();
     diagnostics->queue_empty_observations = audio->queue_empty_observations.load();
     diagnostics->queue_low_observations = audio->queue_low_observations.load();
-    diagnostics->adaptive_stretch_frames = audio->adaptive_stretch_frames.load();
+    diagnostics->adaptive_stretch_frames = audio->adaptive_stretch_frames.load() + audio->rate.frames_added;
 }
 uint32_t volume_get(void* handle, const char*) {
     const sdl_audio* audio = static_cast<const sdl_audio*>(handle);
