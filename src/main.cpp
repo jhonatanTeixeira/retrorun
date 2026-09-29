@@ -1354,8 +1354,18 @@ int main(int argc, char *argv[])
         {
             if (benchmark_deadline_reached())
             {
-                isRunning = false;
-                break;
+                if (benchmark_keep_running())
+                {
+                    // RETRORUN_BENCHMARK_KEEP_RUNNING=1: grava o relatorio/JSON
+                    // da janela medida e continua rodando ate o usuario fechar.
+                    benchmark_finish_and_report();
+                    benchmark_disable();
+                }
+                else
+                {
+                    isRunning = false;
+                    break;
+                }
             }
             // The benchmark owns the run window: frontend hotkeys must not
             // pause, reset, save, or open pages midway through a sample.
