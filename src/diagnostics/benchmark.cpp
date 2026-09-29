@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -36,6 +37,24 @@ struct Counters {
     std::atomic<uint64_t> backend_time_us{0};
 };
 
+struct CounterSnapshot {
+    uint64_t core_frames = 0;
+    uint64_t video_callbacks = 0;
+    uint64_t duplicated_frames = 0;
+    uint64_t skipped_fixed = 0;
+    uint64_t skipped_adaptive = 0;
+    uint64_t skipped_fast_forward = 0;
+    uint64_t skipped_presenter_queue = 0;
+    uint64_t presented_frames = 0;
+    uint64_t direct_frames = 0;
+    uint64_t fallback_frames = 0;
+    uint64_t missed_deadlines = 0;
+    uint64_t audio_callbacks = 0;
+    uint64_t audio_frames = 0;
+    uint64_t presentation_rejections = 0;
+    uint64_t backend_time_us = 0;
+};
+
 struct State {
     BenchmarkOptions options;
     BenchmarkMetadata metadata;
@@ -52,12 +71,20 @@ struct State {
     TimePoint measurement_started{};
     TimePoint measurement_deadline{};
     TimePoint measurement_ended{};
+    // Janela rolante (RETRORUN_BENCHMARK_ROLLING): guarda so os ultimos
+    // `rolling_seconds` de amostras. Cada frame registra o tempo e um snapshot
+    // dos contadores cumulativos; no report a janela = (contador atual -
+    // snapshot mais antigo da janela).
+    bool rolling = false;
+    double rolling_seconds = 0.0;
+    std::deque<TimePoint> frame_times;
+    std::deque<CounterSnapshot> frame_cums;
     std::mutex samples_mutex;
-    std::vector<double> core_us;
-    std::vector<double> video_us;
-    std::vector<double> audio_us;
-    std::vector<double> active_frame_us;
-    std::vector<double> lateness_us;
+    std::deque<double> core_us;
+    std::deque<double> video_us;
+    std::deque<double> audio_us;
+    std::deque<double> active_frame_us;
+    std::deque<double> lateness_us;
 };
 
 State state;
@@ -107,9 +134,11 @@ void reset_counters()
     state.audio_us.clear();
     state.active_frame_us.clear();
     state.lateness_us.clear();
+    state.frame_times.clear();
+    state.frame_cums.clear();
 }
 
-double average(const std::vector<double>& values)
+double average(const std::deque<double>& values)
 {
     if (values.empty()) return 0.0;
     double total = 0.0;
@@ -117,7 +146,7 @@ double average(const std::vector<double>& values)
     return total / static_cast<double>(values.size());
 }
 
-double percentile(std::vector<double> values, double p)
+double percentile(std::deque<double> values, double p)
 {
     if (values.empty()) return 0.0;
     std::sort(values.begin(), values.end());
@@ -176,6 +205,11 @@ bool benchmark_configure(const BenchmarkOptions& options, std::string* error)
     state.confirm_input = false;
     state.confirm_input_delay_seconds = 4.0;
     state.failure.clear();
+    // RETRORUN_BENCHMARK_ROLLING=1: janela rolante -- guarda so os ultimos
+    // `duration_seconds` de amostras (descarta o dado antigo) e reporta essa
+    // janela ao fechar o jogo (nunca fecha sozinha).
+    state.rolling = getenv("RETRORUN_BENCHMARK_ROLLING") != nullptr;
+    state.rolling_seconds = state.rolling ? options.duration_seconds : 0.0;
     return true;
 }
 
@@ -250,6 +284,8 @@ bool benchmark_update_window()
         g_benchmark_collecting.store(true, std::memory_order_release);
         return true;
     }
+    if (state.rolling)
+        return false;   // janela rolante: nunca "completa" sozinha; reporta ao fechar
     const bool frame_limit_reached =
         state.options.core_frames != 0 &&
         state.counters.core_frames.load(std::memory_order_relaxed) >=
@@ -330,10 +366,46 @@ void benchmark_frame_end(TimePoint deadline, bool paced_frame)
         state.video_us.push_back(static_cast<double>(timing.video_us));
         state.audio_us.push_back(static_cast<double>(timing.audio_us));
         state.active_frame_us.push_back(static_cast<double>(active_us));
-        state.lateness_us.push_back(late_us);
+        state.lateness_us.push_back(static_cast<double>(late_us));
         // Store frontend overhead as a sixth, derived vector would be wasteful;
         // it is reconstructed from active minus callback-inclusive core below.
         (void)overhead_us;
+        if (state.rolling)
+        {
+            CounterSnapshot snap;
+            snap.core_frames = state.counters.core_frames.load(std::memory_order_relaxed);
+            snap.video_callbacks = state.counters.video_callbacks.load(std::memory_order_relaxed);
+            snap.duplicated_frames = state.counters.duplicated_frames.load(std::memory_order_relaxed);
+            snap.skipped_fixed = state.counters.skipped_fixed.load(std::memory_order_relaxed);
+            snap.skipped_adaptive = state.counters.skipped_adaptive.load(std::memory_order_relaxed);
+            snap.skipped_fast_forward = state.counters.skipped_fast_forward.load(std::memory_order_relaxed);
+            snap.skipped_presenter_queue = state.counters.skipped_presenter_queue.load(std::memory_order_relaxed);
+            snap.presented_frames = state.counters.presented_frames.load(std::memory_order_relaxed);
+            snap.direct_frames = state.counters.direct_frames.load(std::memory_order_relaxed);
+            snap.fallback_frames = state.counters.fallback_frames.load(std::memory_order_relaxed);
+            snap.missed_deadlines = state.counters.missed_deadlines.load(std::memory_order_relaxed);
+            snap.audio_callbacks = state.counters.audio_callbacks.load(std::memory_order_relaxed);
+            snap.audio_frames = state.counters.audio_frames.load(std::memory_order_relaxed);
+            snap.presentation_rejections = state.counters.presentation_rejections.load(std::memory_order_relaxed);
+            snap.backend_time_us = state.counters.backend_time_us.load(std::memory_order_relaxed);
+            state.frame_times.push_back(now);
+            state.frame_cums.push_back(snap);
+            if (state.rolling_seconds > 0.0)
+            {
+                const auto cutoff = now - std::chrono::duration_cast<Clock::duration>(
+                    std::chrono::duration<double>(state.rolling_seconds));
+                while (!state.frame_times.empty() && state.frame_times.front() < cutoff)
+                {
+                    state.frame_times.pop_front();
+                    state.frame_cums.pop_front();
+                    state.core_us.pop_front();
+                    state.video_us.pop_front();
+                    state.audio_us.pop_front();
+                    state.active_frame_us.pop_front();
+                    state.lateness_us.pop_front();
+                }
+            }
+        }
     }
     timing.frame_active = false;
 }
@@ -416,6 +488,13 @@ bool benchmark_finish_and_report()
 {
     g_benchmark_collecting.store(false, std::memory_order_release);
     if (!state.requested) return true;
+    if (state.rolling && state.started && !state.completed && !state.failed)
+    {
+        // Janela rolante: ao fechar o jogo reporta a janela atual (os ultimos
+        // <= rolling_seconds), mesmo sem ter atingido o deadline.
+        state.measurement_ended = Clock::now();
+        state.completed = true;
+    }
     if (state.failed || !state.started || !state.completed) {
         std::fprintf(stderr, "Benchmark failed: %s\n",
                      state.failure.empty() ? "measurement did not complete" : state.failure.c_str());
@@ -423,7 +502,9 @@ bool benchmark_finish_and_report()
         return false;
     }
 
-    std::vector<double> core, video, audio, active, lateness;
+    std::deque<double> core, video, audio, active, lateness;
+    CounterSnapshot base;
+    TimePoint window_start{};
     {
         std::lock_guard<std::mutex> lock(state.samples_mutex);
         core = state.core_us;
@@ -431,15 +512,29 @@ bool benchmark_finish_and_report()
         audio = state.audio_us;
         active = state.active_frame_us;
         lateness = state.lateness_us;
+        if (state.rolling && !state.frame_cums.empty())
+        {
+            base = state.frame_cums.front();
+            window_start = state.frame_times.front();
+        }
     }
-    const uint64_t fixed = state.counters.skipped_fixed.load();
-    const uint64_t adaptive = state.counters.skipped_adaptive.load();
-    const uint64_t fast = state.counters.skipped_fast_forward.load();
-    const uint64_t queue = state.counters.skipped_presenter_queue.load();
+    auto win = [](uint64_t now, uint64_t base) { return now - base; };
+    const uint64_t fixed = win(state.counters.skipped_fixed.load(), base.skipped_fixed);
+    const uint64_t adaptive = win(state.counters.skipped_adaptive.load(), base.skipped_adaptive);
+    const uint64_t fast = win(state.counters.skipped_fast_forward.load(), base.skipped_fast_forward);
+    const uint64_t queue = win(state.counters.skipped_presenter_queue.load(), base.skipped_presenter_queue);
     const uint64_t skipped = fixed + adaptive + fast + queue;
-    const uint64_t presented = state.counters.presented_frames.load();
-    const uint64_t direct = state.counters.direct_frames.load();
-    const uint64_t fallback = state.counters.fallback_frames.load();
+    const uint64_t presented = win(state.counters.presented_frames.load(), base.presented_frames);
+    const uint64_t direct = win(state.counters.direct_frames.load(), base.direct_frames);
+    const uint64_t fallback = win(state.counters.fallback_frames.load(), base.fallback_frames);
+    const uint64_t w_core_frames = win(state.counters.core_frames.load(), base.core_frames);
+    const uint64_t w_video_callbacks = win(state.counters.video_callbacks.load(), base.video_callbacks);
+    const uint64_t w_audio_callbacks = win(state.counters.audio_callbacks.load(), base.audio_callbacks);
+    const uint64_t w_audio_frames = win(state.counters.audio_frames.load(), base.audio_frames);
+    const uint64_t w_duplicated = win(state.counters.duplicated_frames.load(), base.duplicated_frames);
+    const uint64_t w_rejections = win(state.counters.presentation_rejections.load(), base.presentation_rejections);
+    const uint64_t w_missed = win(state.counters.missed_deadlines.load(), base.missed_deadlines);
+    const double w_backend_us = static_cast<double>(win(state.counters.backend_time_us.load(), base.backend_time_us));
     if (presented != direct + fallback) {
         std::fprintf(stderr, "Benchmark failed: presentation accounting invariant violated\n");
         active_generation.store(0, std::memory_order_release);
@@ -455,22 +550,24 @@ bool benchmark_finish_and_report()
     const double overhead_average = sample_count ? overhead_total / sample_count : 0.0;
     const double requested_duration = state.options.duration_seconds;
     const uint64_t requested_core_frames = state.options.core_frames;
-    const double duration = std::chrono::duration<double>(
-        state.measurement_ended - state.measurement_started).count();
+    const double duration = (state.rolling && window_start != TimePoint{})
+        ? std::chrono::duration<double>(state.measurement_ended - window_start).count()
+        : std::chrono::duration_cast<std::chrono::duration<double>>(
+              state.measurement_ended - state.measurement_started).count();
     const double max_lateness = lateness.empty() ? 0.0
         : *std::max_element(lateness.begin(), lateness.end());
 
     std::printf("\nRetroRun benchmark (%.3f seconds)\n", duration);
-    std::printf("Core frames:              %llu\n", (unsigned long long)state.counters.core_frames.load());
-    std::printf("Video callbacks:          %llu\n", (unsigned long long)state.counters.video_callbacks.load());
+    std::printf("Core frames:              %llu\n", (unsigned long long)w_core_frames);
+    std::printf("Video callbacks:          %llu\n", (unsigned long long)w_video_callbacks);
     std::printf("Presented frames:         %llu\n", (unsigned long long)presented);
     std::printf("Skipped frames:           %llu\n", (unsigned long long)skipped);
-    std::printf("Duplicated frames:        %llu\n", (unsigned long long)state.counters.duplicated_frames.load());
+    std::printf("Duplicated frames:        %llu\n", (unsigned long long)w_duplicated);
     std::printf("Average core time:        %.3f ms\n", average(core) / 1000.0);
     std::printf("Average video time:       %.3f ms\n", average(video) / 1000.0);
     std::printf("Average audio time:       %.3f ms\n", average(audio) / 1000.0);
     std::printf("Average frontend overhead: %.3f ms\n", overhead_average / 1000.0);
-    std::printf("Missed deadlines:         %llu\n", (unsigned long long)state.counters.missed_deadlines.load());
+    std::printf("Missed deadlines:         %llu\n", (unsigned long long)w_missed);
     std::printf("Audio underruns:          %llu\n", (unsigned long long)state.audio.buffer_underruns);
     std::printf("Direct scanout frames:    %llu\n", (unsigned long long)direct);
     std::printf("Fallback frames:          %llu\n", (unsigned long long)fallback);
@@ -507,26 +604,26 @@ bool benchmark_finish_and_report()
          << ",\"adaptive_frameskip\":" << json_bool(state.metadata.adaptive_frameskip)
          << ",\"confirm_input\":" << json_bool(state.metadata.confirm_input)
          << ",\"confirm_input_delay_seconds\":" << state.metadata.confirm_input_delay_seconds << "}"
-         << ",\"counters\":{\"core_frames\":" << state.counters.core_frames.load()
-         << ",\"video_callbacks\":" << state.counters.video_callbacks.load()
-         << ",\"audio_callbacks\":" << state.counters.audio_callbacks.load()
-         << ",\"audio_frames\":" << state.counters.audio_frames.load()
+         << ",\"counters\":{\"core_frames\":" << w_core_frames
+         << ",\"video_callbacks\":" << w_video_callbacks
+         << ",\"audio_callbacks\":" << w_audio_callbacks
+         << ",\"audio_frames\":" << w_audio_frames
          << ",\"presented_frames\":" << presented
          << ",\"direct_scanout_frames\":" << direct
          << ",\"fallback_frames\":" << fallback
-         << ",\"duplicated_frames\":" << state.counters.duplicated_frames.load()
+         << ",\"duplicated_frames\":" << w_duplicated
          << ",\"skipped_frames\":" << skipped
          << ",\"skipped_fixed\":" << fixed
          << ",\"skipped_adaptive\":" << adaptive
          << ",\"skipped_fast_forward\":" << fast
          << ",\"skipped_presenter_queue\":" << queue
-         << ",\"presentation_rejections\":" << state.counters.presentation_rejections.load()
-         << ",\"missed_deadlines\":" << state.counters.missed_deadlines.load() << "}"
+         << ",\"presentation_rejections\":" << w_rejections
+         << ",\"missed_deadlines\":" << w_missed << "}"
          << ",\"timing_ms\":{\"core_average\":" << average(core) / 1000.0
          << ",\"video_average\":" << average(video) / 1000.0
          << ",\"audio_average\":" << average(audio) / 1000.0
          << ",\"frontend_overhead_average\":" << overhead_average / 1000.0
-         << ",\"backend_total\":" << state.counters.backend_time_us.load() / 1000.0
+         << ",\"backend_total\":" << w_backend_us / 1000.0
          << ",\"core_p50\":" << percentile(core, .50) / 1000.0
          << ",\"core_p95\":" << percentile(core, .95) / 1000.0
          << ",\"core_p99\":" << percentile(core, .99) / 1000.0
