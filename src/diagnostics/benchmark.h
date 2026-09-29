@@ -109,6 +109,12 @@ double benchmark_confirm_input_delay();
 bool benchmark_confirm_button_pressed(BenchmarkConfirmButton button);
 bool benchmark_update_window();
 bool benchmark_deadline_reached();
+// RETRORUN_BENCHMARK_KEEP_RUNNING=1: quando a janela do benchmark termina,
+// grava o relatorio/JSON mas NAO encerra o jogo (continua rodando ate o
+// usuario fechar). Util para baterias: numeros + tempo de jogo para observar
+// crash/glitch.
+bool benchmark_keep_running();
+void benchmark_disable();
 void benchmark_abort(const std::string& reason);
 
 void benchmark_frame_begin();

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -266,6 +267,19 @@ bool benchmark_deadline_reached()
     if (!state.requested || state.failed) return false;
     benchmark_update_window();
     return state.completed;
+}
+
+bool benchmark_keep_running()
+{
+    static int enabled = -1;
+    if (enabled == -1)
+        enabled = getenv("RETRORUN_BENCHMARK_KEEP_RUNNING") != nullptr ? 1 : 0;
+    return enabled == 1;
+}
+
+void benchmark_disable()
+{
+    state.requested = false;
 }
 
 void benchmark_abort(const std::string& reason)
