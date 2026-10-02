@@ -1369,14 +1369,25 @@ int main(int argc, char *argv[])
             }
             // The benchmark owns the run window: frontend hotkeys must not
             // pause, reset, save, or open pages midway through a sample.
-            input_info_requested = false;
-            input_credits_requested = false;
-            input_pause_requested = false;
-            input_ffwd_requested = false;
-            input_reset_requested = false;
-            input_slot_memory_load_requested = false;
-            input_slot_memory_save_requested = false;
-            pause_requested = false;
+            // RETRORUN_BENCHMARK_ALLOW_HOTKEYS=1: o usuario joga de verdade com o
+            // benchmark ligado (captura da bateria) -- as teclas (savestate,
+            // pausa, menu) continuam valendo; com janela rolante um save/load
+            // so aparece como um solavanco nos numeros.
+            static const bool allowHotkeys = [] {
+                const char* v = std::getenv("RETRORUN_BENCHMARK_ALLOW_HOTKEYS");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
+            if (!allowHotkeys)
+            {
+                input_info_requested = false;
+                input_credits_requested = false;
+                input_pause_requested = false;
+                input_ffwd_requested = false;
+                input_reset_requested = false;
+                input_slot_memory_load_requested = false;
+                input_slot_memory_save_requested = false;
+                pause_requested = false;
+            }
         }
         const bool measureBenchmarkFrame = benchmark_collecting();
         if (measureBenchmarkFrame)
