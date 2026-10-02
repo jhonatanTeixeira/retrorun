@@ -1620,22 +1620,32 @@ struct present_worker_state {
     bool command_done = false;
     int swap_interval = 0;
     bool swap_interval_dirty = false;
-    bool job_pending = false;
+    // Fila de quadros para o apresentador. RETRORUN_PRESENT_DEPTH=1 (padrao):
+    // 1 quadro pendente e 2 texturas -- em FIFO o retro_run() espera o
+    // apresentador pegar o anterior, o que so acontece depois do vblank (a
+    // thread do core fica ~13 ms/quadro parada ali no flycast e perde quadros
+    // do jogo). =2: ate 2 pendentes e 3 texturas (triple buffering): a tela
+    // continua no ritmo do vsync, mas quem chama retro_run() so espera com 2
+    // quadros ja na fila. Custa ate 1 quadro de latencia.
+    static constexpr int kMaxSlots = 3;
+    int depth = 1;
+    int nslots = 2;
+    present_job jobs[2];
+    int njobs = 0;
     bool busy = false;              // presenter is working on a job
-    present_job job;
-    bool slot_busy[2] = {false, false};
-    GLsync slot_release[2] = {0, 0};
+    bool slot_busy[kMaxSlots] = {false, false, false};
+    GLsync slot_release[kMaxSlots] = {0, 0, 0};
     int next_slot = 0;
     unsigned long dropped = 0;      // frames replaced before reaching the screen
     // main-thread (core context) side
-    GLuint target_texture[2] = {0, 0};
-    GLuint target_fbo[2] = {0, 0};
+    GLuint target_texture[kMaxSlots] = {0, 0, 0};
+    GLuint target_fbo[kMaxSlots] = {0, 0, 0};
     int target_width = 0;
     int target_height = 0;
     int current_slot = -1;
     // presenter-thread side (FBOs are not shared between contexts)
-    GLuint read_fbo[2] = {0, 0};
-    GLuint read_fbo_texture[2] = {0, 0};
+    GLuint read_fbo[kMaxSlots] = {0, 0, 0};
+    GLuint read_fbo_texture[kMaxSlots] = {0, 0, 0};
 };
 present_worker_state pw;
 }
@@ -1643,7 +1653,7 @@ present_worker_state pw;
 static void present_worker_thread() {
     std::unique_lock<std::mutex> lock(pw.mutex);
     for (;;) {
-        pw.cv.wait(lock, [] { return pw.command != present_worker_state::None || pw.job_pending; });
+        pw.cv.wait(lock, [] { return pw.command != present_worker_state::None || pw.njobs > 0; });
         if (pw.command == present_worker_state::Quit) {
             pw.command = present_worker_state::None;
             pw.command_done = true;
@@ -1662,7 +1672,7 @@ static void present_worker_thread() {
         }
         if (pw.command == present_worker_state::Release) {
             lock.unlock();
-            for (int i = 0; i < 2; ++i) {
+            for (int i = 0; i < present_worker_state::kMaxSlots; ++i) {
                 if (pw.read_fbo[i]) glDeleteFramebuffers(1, &pw.read_fbo[i]);
                 pw.read_fbo[i] = 0;
                 pw.read_fbo_texture[i] = 0;
@@ -1676,8 +1686,9 @@ static void present_worker_thread() {
             continue;
         }
         // A job: present one composed frame.
-        present_job job = pw.job;
-        pw.job_pending = false;
+        present_job job = pw.jobs[0];
+        pw.jobs[0] = pw.jobs[1];
+        --pw.njobs;
         pw.busy = true;
         const bool interval_dirty = pw.swap_interval_dirty;
         const int interval = pw.swap_interval;
@@ -1848,6 +1859,13 @@ static bool present_worker_acquire(rr_context_t* context) {
             return false;
         }
         pw.swap_interval = vsync_enabled ? 1 : 0;
+        {
+            const char* d = std::getenv("RETRORUN_PRESENT_DEPTH");
+            pw.depth = (d != nullptr && std::atoi(d) >= 2) ? 2 : 1;
+            pw.nslots = pw.depth + 1;
+            std::fprintf(stderr, "RetroRun SDL threaded presentation: queue depth %d (%d textures)\n",
+                         pw.depth, pw.nslots);
+        }
         pw.thread = std::thread(present_worker_thread);
         pw.started = true;
         std::fprintf(stderr, "RetroRun SDL threaded presentation active\n");
@@ -1884,7 +1902,7 @@ static bool present_worker_acquire(rr_context_t* context) {
 static void present_worker_release() {
     if (!pw.owns_surface) return;
     std::unique_lock<std::mutex> lock(pw.mutex);
-    pw.cv.wait(lock, [] { return !pw.job_pending && !pw.busy; });
+    pw.cv.wait(lock, [] { return pw.njobs == 0 && !pw.busy; });
     pw.command = present_worker_state::Release;
     pw.command_done = false;
     pw.cv.notify_all();
@@ -1908,17 +1926,20 @@ static void present_worker_begin_frame(int width, int height) {
         // releases it as soon as the copy is issued (before its swap).
         int slot = -1;
         for (;;) {
-            const int preferred = pw.next_slot;
-            if (!pw.slot_busy[preferred]) { slot = preferred; break; }
-            if (!pw.slot_busy[preferred ^ 1]) { slot = preferred ^ 1; break; }
+            for (int k = 0; k < pw.nslots; ++k) {
+                const int cand = (pw.next_slot + k) % pw.nslots;
+                if (!pw.slot_busy[cand]) { slot = cand; break; }
+            }
+            if (slot >= 0) break;
             // With vsync the display is the clock: FIFO, wait for a slot
             // (it frees at the next vblank) so retro_run() is paced at the
             // refresh rate. Without vsync there is no clock to follow:
             // mailbox, take the queued frame back.
-            if (pw.job_pending && (pw.swap_interval == 0 || !pw.vsync_fifo)) {
-                slot = pw.job.slot;
-                dropped_fence = pw.job.fence;
-                pw.job_pending = false;
+            if (pw.njobs > 0 && (pw.swap_interval == 0 || !pw.vsync_fifo)) {
+                present_job& back = pw.jobs[pw.njobs - 1];
+                slot = back.slot;
+                dropped_fence = back.fence;
+                --pw.njobs;
                 pw.slot_busy[slot] = false;
                 ++pw.dropped;
                 break;
@@ -1941,9 +1962,11 @@ static void present_worker_begin_frame(int width, int height) {
         {
             std::unique_lock<std::mutex> lock(pw.mutex);
             pw.cv.wait(lock, [] {
-                return !pw.job_pending && !pw.busy && !pw.slot_busy[0] && !pw.slot_busy[1];
+                for (int i = 0; i < pw.nslots; ++i)
+                    if (pw.slot_busy[i]) return false;
+                return pw.njobs == 0 && !pw.busy;
             });
-            for (int i = 0; i < 2; ++i) {
+            for (int i = 0; i < pw.nslots; ++i) {
                 if (pw.slot_release[i]) {
                     glWaitSync(pw.slot_release[i], 0, GL_TIMEOUT_IGNORED);
                     glDeleteSync(pw.slot_release[i]);
@@ -1954,7 +1977,7 @@ static void present_worker_begin_frame(int width, int height) {
         GLint previous_texture = 0, previous_draw = 0;
         glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture);
         glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previous_draw);
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < pw.nslots; ++i) {
             if (!pw.target_texture[i]) glGenTextures(1, &pw.target_texture[i]);
             glBindTexture(GL_TEXTURE_2D, pw.target_texture[i]);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -1985,22 +2008,26 @@ static void present_worker_submit(uint64_t generation) {
     // display. Waiting here made retro_run() alternate between ~15ms and
     // ~33ms in a 60fps game and the audio arrive in bursts.
     if (pw.swap_interval != 0 && pw.vsync_fifo) {
-        // FIFO under vsync: wait for the presenter to take the queued frame.
-        pw.cv.wait(lock, [] { return !pw.job_pending; });
-    } else if (pw.job_pending) {
-        glDeleteSync(pw.job.fence);
-        pw.slot_busy[pw.job.slot] = false;
-        pw.job_pending = false;
-        ++pw.dropped;
+        // FIFO under vsync: wait only while the queue is full (depth 1: the
+        // previous frame must have been taken; depth 2: triple buffering).
+        pw.cv.wait(lock, [] { return pw.njobs < pw.depth; });
+    } else {
+        // mailbox: everything still queued is superseded by this frame
+        while (pw.njobs > 0) {
+            present_job& back = pw.jobs[--pw.njobs];
+            glDeleteSync(back.fence);
+            pw.slot_busy[back.slot] = false;
+            ++pw.dropped;
+        }
     }
-    pw.job.slot = pw.current_slot;
-    pw.job.fence = fence;
-    pw.job.width = pw.target_width;
-    pw.job.height = pw.target_height;
-    pw.job.generation = generation;
-    pw.job_pending = true;
+    present_job& job = pw.jobs[pw.njobs++];
+    job.slot = pw.current_slot;
+    job.fence = fence;
+    job.width = pw.target_width;
+    job.height = pw.target_height;
+    job.generation = generation;
     pw.slot_busy[pw.current_slot] = true;
-    pw.next_slot = pw.current_slot ^ 1;
+    pw.next_slot = (pw.current_slot + 1) % pw.nslots;
     pw.cv.notify_all();
     present_target_fbo = 0;
 }
@@ -2016,7 +2043,7 @@ static void present_worker_shutdown() {
         pw.cv.wait(lock, [] { return pw.command_done; });
     }
     pw.thread.join();
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < present_worker_state::kMaxSlots; ++i) {
         if (pw.slot_release[i]) glDeleteSync(pw.slot_release[i]);
         pw.slot_release[i] = 0;
         if (pw.target_fbo[i]) glDeleteFramebuffers(1, &pw.target_fbo[i]);
@@ -2042,6 +2069,27 @@ static void present_worker_begin_frame(int, int) {}
 static void present_worker_submit(uint64_t) {}
 static void present_worker_shutdown() {}
 #endif
+
+// RETRORUN_PRESENT_TIMING=1 (diagnostico): onde a thread do retro_run() gasta
+// o tempo da apresentacao em thread -- begin_frame (pegar textura), composicao
+// GL (clear/blit/post) e submit (entregar ao apresentador). Media a cada 300.
+static int present_timing_on() {
+    static int on = -1;
+    if (on < 0) on = std::getenv("RETRORUN_PRESENT_TIMING") ? 1 : 0;
+    return on;
+}
+static void present_timing_add(uint64_t begin_us, uint64_t compose_us, uint64_t submit_us) {
+    static uint64_t b = 0, c = 0, s = 0, mb = 0, mc = 0, ms = 0;
+    static unsigned n = 0;
+    b += begin_us; c += compose_us; s += submit_us;
+    mb = std::max(mb, begin_us); mc = std::max(mc, compose_us); ms = std::max(ms, submit_us);
+    if (++n == 300) {
+        std::fprintf(stderr, "RetroRun present timing (300 quadros): begin_frame %.2f ms (max %.2f) | composicao %.2f ms (max %.2f) | submit %.2f ms (max %.2f)\n",
+                     b / 300000.0, mb / 1000.0, c / 300000.0, mc / 1000.0, s / 300000.0, ms / 1000.0);
+        b = c = s = mb = mc = ms = 0;
+        n = 0;
+    }
+}
 
 void rr_context_swap_buffers(rr_context_t* context, int source_width, int source_height,
                              int dest_x, int dest_y, int dest_width, int dest_height,
@@ -2121,10 +2169,13 @@ void rr_context_swap_buffers(rr_context_t* context, int source_width, int source
     const int top = drawable_height - static_cast<int>(dest_y * scale_y);
 
     const bool threaded = present_worker_wanted(context) && present_worker_acquire(context);
+    const bool ptiming = threaded && present_timing_on();
+    const auto pt0 = ptiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (threaded)
         present_worker_begin_frame(drawable_width, drawable_height);
     else
         present_worker_release();
+    const auto pt1 = ptiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     GLint previous_read = 0;
     GLint previous_draw = 0;
@@ -2170,7 +2221,15 @@ void rr_context_swap_buffers(rr_context_t* context, int source_width, int source
                   drawable_width, drawable_height, rotation);
     const uint64_t generation = benchmark_capture_generation();
     if (threaded) {
+        const auto pt2 = ptiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         present_worker_submit(generation);
+        if (ptiming) {
+            const auto pt3 = std::chrono::steady_clock::now();
+            auto us = [](std::chrono::steady_clock::duration d) {
+                return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(d).count());
+            };
+            present_timing_add(us(pt1 - pt0), us(pt2 - pt1), us(pt3 - pt2));
+        }
         present_worker_auto_update(true, 0);
     } else {
         const auto started = std::chrono::steady_clock::now();
