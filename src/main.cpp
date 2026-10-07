@@ -612,7 +612,13 @@ static void applyFlycastGameCatalog(const char *executable,
     else if (coreName == "Flycast 2021")
         coreOptionPrefix = "flycast2021_";
     else if (isFlycast())
-        coreOptionPrefix = "flycast_";
+    {
+        // A variante declarada pelo core decide o prefixo: o nosso fork expoe
+        // "flycast2026" (e usa flycast2026_*), um Flycast stock nao expoe nada
+        // e usa flycast_*.
+        const std::string variant = core_flycast_variant();
+        coreOptionPrefix = variant.empty() ? "flycast_" : variant + "_";
+    }
     applyTransientConfigOverrides(
         settingsForOptionPrefix(profile.settings, coreOptionPrefix));
     logger.log(
