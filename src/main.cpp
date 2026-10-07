@@ -1427,14 +1427,12 @@ int main(int argc, char *argv[])
         // frame start for optional profiling and begin measuring on the next
         // complete fast-forward frame.
         const bool profileFastForwardFrame = input_ffwd_requested;
-#ifndef RR_PLATFORM_SDL
         // Timing the loop is useful only to adaptive frameskip. Avoid an
         // otherwise unnecessary clock read on every frame when it is off.
         const bool measureAdaptiveLoop = adaptiveFrameSkip &&
             runLoopAtDeclaredfps && !input_ffwd_requested;
         const auto loopStart = measureAdaptiveLoop
             ? steady_clock::now() : steady_clock::time_point{};
-#endif
         input_message = false;
         const auto achievementsStarted = profileFastForwardFrame
             ? steady_clock::now() : steady_clock::time_point{};
@@ -1606,7 +1604,6 @@ int main(int argc, char *argv[])
             input_slot_memory_minus_requested = false;
         }
 
-#ifndef RR_PLATFORM_SDL
         const nanoseconds frameDurationNs = duration_cast<nanoseconds>(frameDuration);
 
         static nanoseconds frameDebt = nanoseconds::zero();
@@ -1689,7 +1686,6 @@ int main(int argc, char *argv[])
             recoverCooldown = 0;
             debtRatioEma = 0.0;
         }
-#endif
 
         if (measureBenchmarkFrame)
             benchmark_frame_end(nextFrameDeadline + frameDurationTick,

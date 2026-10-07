@@ -1120,7 +1120,6 @@ void core_video_refresh(const void *data, unsigned width, unsigned height, size_
     if (measureFastForward)
         ++fastForwardVideoCallbackCount;
 
-#ifndef RR_PLATFORM_SDL
     // Fixed presentation-only frameskip, equivalent to the strategy used by
     // many emulators: value 1 presents one frame out of two, value 2 one out
     // of three, and so on. The display keeps scanning out the last submitted
@@ -1155,7 +1154,6 @@ void core_video_refresh(const void *data, unsigned width, unsigned height, size_
     {
         fixedFramesRemaining = fixedFrameSkip;
     }
-#endif
 
   
     if (input_info_requested)
@@ -1195,7 +1193,6 @@ void core_video_refresh(const void *data, unsigned width, unsigned height, size_
         }
     }
 
-#ifndef RR_PLATFORM_SDL
     if (skipNextVideoFrame && !showLoading && !input_info_requested &&
         !input_message && !input_ffwd_requested)
     {
@@ -1204,7 +1201,6 @@ void core_video_refresh(const void *data, unsigned width, unsigned height, size_
             benchmark_video_skipped(BenchmarkSkipReason::Adaptive);
         return;
     }
-#endif
 
     // Fast-forward must not be throttled by the display. RetroArch switches
     // its video driver to non-blocking mode; RetroRun's presenters do not
