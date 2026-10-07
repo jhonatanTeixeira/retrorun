@@ -42,10 +42,13 @@
 // changes. State is carried across chunks (no seams).
 class AudioTimeStretch {
 public:
-    static constexpr int kFrame = 1024;              // window length
-    static constexpr int kHop = 512;                 // synthesis hop (output)
+    // Hop curto (11,6 ms de janela, 5,8 ms de saida): a saida chega em blocos
+    // de kHop, e um hop grande faz a fila do backend oscilar (underruns). 512/256
+    // ainda da resolucao de frequencia de sobra pra musica.
+    static constexpr int kFrame = 512;               // window length
+    static constexpr int kHop = 256;                 // synthesis hop (output)
     static constexpr int kOverlap = kFrame - kHop;   // overlap region
-    static constexpr int kSearch = 128;              // +- alignment search
+    static constexpr int kSearch = 64;               // +- alignment search
 
     AudioTimeStretch() {
         window_.resize(kFrame);
