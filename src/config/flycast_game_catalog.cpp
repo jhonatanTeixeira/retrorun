@@ -22,7 +22,7 @@ constexpr const char *CatalogFilename = "flycast-game-catalog.ini";
 
 const char *BuiltinCatalogText = R"catalog(
 schema_version = 3
-catalog_version = 20261003
+catalog_version = 20261007
 
 default.retrorun_vsync = false
 default.retrorun_loop_declared_fps = true
@@ -1231,6 +1231,43 @@ chip.RK3566.profile.MK-51058.best_performance.reicast_aica_arm_cycles = 32
 
 profile.MK-51084.best_validated.title = Jet Grind Radio (USA revision, baseline)
 
+profile.HDR-0079.best_validated.title = Napple Tale - Arsia in Daydream
+profile.HDR-0079.best_validated.retrorun_alternative_input_mode = true
+profile.HDR-0079.best_validated.retrorun_swap_l1r1_with_l2r2 = true
+profile.HDR-0079.best_validated.retrorun_force_left_analog_stick = false
+profile.HDR-0079.best_validated.retrorun_show_loading_screen = false
+profile.HDR-0079.best_validated.retrorun_analog_to_digital = left
+profile.HDR-0079.best_validated.retrorun_audio_buffer = -1
+profile.HDR-0079.best_validated.retrorun_audio_stable_buffer = true
+profile.HDR-0079.best_validated.retrorun_force_audio_multithread = true
+profile.HDR-0079.best_validated.retrorun_adaptive_frameskip = true
+profile.HDR-0079.best_validated.retrorun_frameskip = 0
+profile.HDR-0079.best_validated.retrorun_loop_declared_fps = false
+profile.HDR-0079.best_validated.retrorun_disable_rumble = true
+profile.HDR-0079.best_validated.reicast_threaded_rendering = enabled
+profile.HDR-0079.best_validated.reicast_synchronous_rendering = disabled
+profile.HDR-0079.best_validated.reicast_delay_frame_swapping = disabled
+profile.HDR-0079.best_validated.reicast_internal_resolution = 640x480
+profile.HDR-0079.best_validated.reicast_alpha_sorting = per-strip (fast, least accurate)
+profile.HDR-0079.best_validated.reicast_div_matching = auto
+profile.HDR-0079.best_validated.reicast_enable_rttb = disabled
+profile.HDR-0079.best_validated.reicast_enable_dsp = disabled
+profile.HDR-0079.best_validated.reicast_anisotropic_filtering = disabled
+profile.HDR-0079.best_validated.reicast_texupscale = disabled
+profile.HDR-0079.best_validated.reicast_framerate = normal
+profile.HDR-0079.best_validated.reicast_frame_skipping = disabled
+profile.HDR-0079.best_validated.reicast_frame_budget_skip_translucent = disabled
+profile.HDR-0079.best_validated.reicast_sh4_timeslice = 1x
+profile.HDR-0079.best_validated.reicast_hle_bios = enabled
+profile.HDR-0079.best_validated.reicast_gdrom_fast_loading = enabled
+profile.HDR-0079.best_validated.reicast_enable_purupuru = enabled
+profile.HDR-0079.best_validated.reicast_volume_modifier_enable = disabled
+profile.HDR-0079.best_validated.reicast_sh4clock = d10
+profile.HDR-0079.best_validated.reicast_tier2 = enabled
+
+profile.HDR-0079.best_performance.title = Napple Tale - Arsia in Daydream (aggressive)
+profile.HDR-0079.best_performance.inherits = best_validated
+
 profile.HDR-0078.best_validated.title = Jet Set Radio (Japan, baseline)
 
 profile.HDR-0128.best_validated.title = De La Jet Set Radio (Japan, baseline)
@@ -2376,6 +2413,12 @@ const std::unordered_set<std::string> &allowedSettings()
         "retrorun_sdl_audio_stretch_percent",
         "retrorun_vsync",
         "retrorun_video_multithread_mode",
+        "retrorun_alternative_input_mode",
+        "retrorun_swap_l1r1_with_l2r2",
+        "retrorun_force_left_analog_stick",
+        "retrorun_show_loading_screen",
+        "retrorun_analog_to_digital",
+        "retrorun_disable_rumble",
         "reicast_adjacent_state_elision",
         "reicast_accurate_aica_batch",
         "reicast_aica_better_lpf",
@@ -2399,6 +2442,7 @@ const std::unordered_set<std::string> &allowedSettings()
         "reicast_fog",
         "reicast_force_wince",
         "reicast_fmov_fpr64",
+        "reicast_frame_budget_skip_translucent",
         "reicast_loop_declared_fps",
         "reicast_frame_skipping",
         "reicast_framerate",
@@ -2415,6 +2459,7 @@ const std::unordered_set<std::string> &allowedSettings()
         "reicast_screen_rotation",
         "reicast_sh4clock",
         "reicast_sh4_cycle_mode",
+        "reicast_sh4_timeslice",
         "reicast_shared_block_checks",
         "reicast_synchronous_rendering",
         "reicast_system",
@@ -2422,6 +2467,7 @@ const std::unordered_set<std::string> &allowedSettings()
         "reicast_texupscale",
         "reicast_texupscale_max_filtered_texture_size",
         "reicast_threaded_rendering",
+        "reicast_tier2",
         "reicast_translucent_menu_guard_depth_tolerance",
         "reicast_translucent_menu_guard_draw_sorting",
         "reicast_translucent_menu_guard_max_vertices",
