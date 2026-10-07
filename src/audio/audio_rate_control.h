@@ -21,6 +21,9 @@
 // Environment: RETRORUN_AUDIO_RATE_CONTROL=0 disables it;
 // RETRORUN_AUDIO_MIN_SPEED_PERCENT (default 50) is the slowest playback;
 // RETRORUN_AUDIO_DRC_PERMILLE (default 10) is the queue correction.
+// RETRORUN_AUDIO_TIME_STRETCH=0 falls back to the plain resampler (pitch
+// follows the tape speed); the default (1) uses WSOLA so the music slows
+// down but stays in tune.
 
 #include <algorithm>
 #include <chrono>
@@ -31,6 +34,129 @@
 #include <limits>
 #include <vector>
 
+// WSOLA time-scale modification (Verhelst & Roelands): the signal is cut in
+// overlapping Hann-windowed frames, each new frame is aligned (cross
+// correlation over +-kSearch) with the natural continuation of the previous
+// one, and the frames are overlap-added with a hop that differs from the
+// analysis hop by the stretch factor. Pitch is preserved; only the tempo
+// changes. State is carried across chunks (no seams).
+class AudioTimeStretch {
+public:
+    static constexpr int kFrame = 1024;              // window length
+    static constexpr int kHop = 512;                 // synthesis hop (output)
+    static constexpr int kOverlap = kFrame - kHop;   // overlap region
+    static constexpr int kSearch = 128;              // +- alignment search
+
+    AudioTimeStretch() {
+        window_.resize(kFrame);
+        for (int n = 0; n < kFrame; ++n)
+            window_[n] = 0.5f * (1.0f - std::cos(2.0f * 3.14159265358979323846f * n / kFrame));
+        reset();
+    }
+
+    void reset() {
+        in_.clear();
+        in_base_ = 0;
+        next_ana_ = 0.0;
+        prev_start_ = -1;
+        tail_.assign(kOverlap * 2, 0);
+        frame_.assign(kFrame * 2, 0);
+        out_.clear();
+    }
+
+    // Stretches one chunk by `ratio` (output duration / input duration).
+    // Returns the output frame count; out() holds them.
+    int process(const short* data, int frames, double ratio) {
+        if (frames <= 0) return 0;
+        ratio = std::clamp(ratio, 0.5, 4.0);
+        in_.insert(in_.end(), data, data + (size_t)frames * 2);
+
+        const long long end_abs = in_base_ + (long long)(in_.size() / 2);
+        const double analysis_hop = (double)kHop / ratio;
+
+        // Generous, still bounded: the leftover input is ~kFrame+kSearch.
+        const int max_out = (int)((double)(in_.size() / 2) * ratio) + kFrame + 8;
+        if ((int)(out_.size() / 2) < max_out)
+            out_.resize((size_t)max_out * 2);
+        int out = 0;
+
+        for (;;) {
+            const long long nominal = (long long)std::llround(next_ana_);
+            if (nominal + kSearch + kFrame > end_abs) break;
+            if (out + kHop > max_out) break;
+
+            long long p = nominal;
+            if (prev_start_ >= 0) {
+                const long long ref = prev_start_ + kHop;
+                long long lo = std::max(nominal - kSearch, (long long)in_base_);
+                long long hi = std::min(nominal + kSearch, end_abs - kFrame);
+                lo = std::max(lo, prev_start_ + 1);
+                if (lo > hi) lo = hi;
+                const short* rp = in_.data() + (size_t)(ref - in_base_) * 2;
+                long long best_delta = 0;
+                int64_t best = std::numeric_limits<int64_t>::min();
+                for (long long c = lo; c <= hi; ++c) {
+                    const short* cp = in_.data() + (size_t)(c - in_base_) * 2;
+                    int64_t acc = 0;
+                    // Correlaciona a cada 2 amostras: metade do custo, mesma
+                    // precisao de alinhamento (256 pontos por candidato).
+                    for (int n = 0; n < kOverlap; n += 2)
+                        acc += (int64_t)(rp[n * 2] + rp[n * 2 + 1]) *
+                               (int64_t)(cp[n * 2] + cp[n * 2 + 1]);
+                    if (acc > best) { best = acc; best_delta = c - nominal; }
+                }
+                p = nominal + best_delta;
+            }
+            p = std::clamp(p, (long long)in_base_, end_abs - kFrame);
+            if (prev_start_ >= 0 && p <= prev_start_) p = prev_start_ + 1;
+            if (p + kFrame > end_abs) break;
+
+            const short* x = in_.data() + (size_t)(p - in_base_) * 2;
+            for (int n = 0; n < kFrame; ++n) {
+                const float w = window_[n];
+                frame_[n * 2] = (short)std::lround(x[n * 2] * w);
+                frame_[n * 2 + 1] = (short)std::lround(x[n * 2 + 1] * w);
+            }
+            short* o = out_.data() + (size_t)out * 2;
+            for (int n = 0; n < kHop; ++n) {
+                o[n * 2] = (short)std::clamp(
+                    (int)tail_[n * 2] + (int)frame_[n * 2], -32768, 32767);
+                o[n * 2 + 1] = (short)std::clamp(
+                    (int)tail_[n * 2 + 1] + (int)frame_[n * 2 + 1], -32768, 32767);
+            }
+            out += kHop;
+            for (int n = 0; n < kOverlap; ++n) {
+                tail_[n * 2] = frame_[(kHop + n) * 2];
+                tail_[n * 2 + 1] = frame_[(kHop + n) * 2 + 1];
+            }
+            prev_start_ = p;
+            next_ana_ += analysis_hop;
+        }
+
+        long long keep = (long long)next_ana_ - kSearch;
+        if (prev_start_ >= 0) keep = std::min(keep, prev_start_ + kHop);
+        if (keep > in_base_) {
+            const size_t drop = (size_t)(keep - in_base_);
+            if (drop * 2 >= in_.size()) in_.clear();
+            else in_.erase(in_.begin(), in_.begin() + (long)drop * 2);
+            in_base_ = keep;
+        }
+        return out;
+    }
+
+    const short* out() const { return out_.data(); }
+
+private:
+    std::vector<float> window_;
+    std::vector<short> in_;         // pending input, interleaved stereo
+    long long in_base_ = 0;         // absolute index of in_[0]
+    double next_ana_ = 0.0;         // nominal analysis position
+    long long prev_start_ = -1;     // input position of the last frame
+    std::vector<short> tail_;       // last frame's windowed second half
+    std::vector<short> frame_;      // scratch
+    std::vector<short> out_;        // output
+};
+
 class AudioRateControl {
 public:
     void configure(int frequency, int target_queue_ms) {
@@ -38,14 +164,17 @@ public:
         enabled_ = env_int("RETRORUN_AUDIO_RATE_CONTROL", 1, 0, 1) != 0;
         max_ratio_ = 100.0 / env_int("RETRORUN_AUDIO_MIN_SPEED_PERCENT", 50, 10, 100);
         gain_ = env_int("RETRORUN_AUDIO_DRC_PERMILLE", 10, 0, 50) / 1000.0;
+        time_stretch_ = env_int("RETRORUN_AUDIO_TIME_STRETCH", 1, 0, 1) != 0;
         // perto do teto da fila (a contrapressao segura em target_queue_ms):
         // a 100% a fila fica ali e a correcao fina quase nao age (~0,2%)
         target_frames_ = static_cast<double>(frequency) *
             std::max(20, target_queue_ms * 85 / 100) / 1000.0;
         reset();
         std::fprintf(stderr,
-            "RetroRun audio rate control: %s, min_speed=%.0f%%, drc=%.1f%%, target=%.0f frames\n",
-            enabled_ ? "on" : "off", 100.0 / max_ratio_, gain_ * 100.0, target_frames_);
+            "RetroRun audio rate control: %s, min_speed=%.0f%%, drc=%.1f%%, target=%.0f frames, "
+            "time_stretch=%s\n",
+            enabled_ ? "on" : "off", 100.0 / max_ratio_, gain_ * 100.0, target_frames_,
+            time_stretch_ ? "on" : "off");
     }
 
     bool enabled() const { return enabled_; }
@@ -54,6 +183,7 @@ public:
     void reset() {
         history_valid_ = false;
         pos_ = 0.0;
+        stretch_.reset();
         break_measurement();
     }
 
@@ -105,6 +235,16 @@ public:
         if (ratio > 1.3 && first_slow_chunk == 0)
             first_slow_chunk = ratio_count;
 
+        // Pitch-preserving path: WSOLA keeps the tone and only changes the
+        // tempo, so a slow game plays "in slow motion" instead of detuned.
+        if (time_stretch_) {
+            const int out = stretch_.process(data, frames, ratio);
+            if (out > frames)
+                frames_added += static_cast<uint64_t>(out - frames);
+            output_frames = out;
+            return out;
+        }
+
         // input = 3 history frames + this chunk; pos is relative to frame 0,
         // interpolation between pos+1 and pos+2
         if (!history_valid_) {
@@ -146,7 +286,9 @@ public:
         return out;
     }
 
-    const short* output() const { return output_.data(); }
+    const short* output() const {
+        return time_stretch_ ? stretch_.out() : output_.data();
+    }
 
     // after the chunk was queued
     void submitted() { last_end_ = std::chrono::steady_clock::now(); }
@@ -202,6 +344,8 @@ private:
 
     int frequency_ = 0;
     bool enabled_ = true;
+    bool time_stretch_ = true;
+    AudioTimeStretch stretch_;
     double max_ratio_ = 2.0;
     double gain_ = 0.01;
     double target_frames_ = 0.0;
